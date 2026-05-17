@@ -29,8 +29,6 @@ services:
       - "50000:50000"
     volumes:
       - jenkins_home:/var/jenkins_home
-      - /Users/nagarjunar/Java-Ecommerce-New:/var/jenkins_home/project
-      - /Users/nagarjunar/.m2:/var/jenkins_home/.m2
     networks:
       - ecommerce-network
     depends_on:

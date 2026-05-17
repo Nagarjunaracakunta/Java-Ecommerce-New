@@ -1,29 +1,33 @@
 pipeline {
     agent any
 
+    triggers {
+        githubPush()
+    }
+
     stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
         stage('Build') {
             steps {
-                dir('/var/jenkins_home/project') {
-                    sh 'mvn clean compile -q'
-                }
+                sh 'mvn clean compile -q'
             }
         }
 
         stage('Test & Coverage') {
             steps {
-                dir('/var/jenkins_home/project') {
-                    sh 'mvn verify'
-                    junit 'target/surefire-reports/*.xml'
-                }
+                sh 'mvn verify'
+                junit 'target/surefire-reports/*.xml'
             }
         }
 
         stage('SonarQube Analysis') {
             steps {
-                dir('/var/jenkins_home/project') {
-                    sh 'mvn sonar:sonar -Dsonar.host.url=http://sonarqube:9000'
-                }
+                sh 'mvn sonar:sonar -Dsonar.host.url=http://sonarqube:9000'
             }
         }
     }

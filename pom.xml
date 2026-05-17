@@ -32,6 +32,7 @@
         <sonar.projectKey>java-ecommerce</sonar.projectKey>
         <sonar.projectName>Java Ecommerce New</sonar.projectName>
         <sonar.login>squ_45caa6fedd04c5e88c5093c69e28d2897ba3b35c</sonar.login>
+        <sonar.coverage.jacoco.xmlReportPaths>${project.build.directory}/site/jacoco/jacoco.xml</sonar.coverage.jacoco.xmlReportPaths>
     </properties>
     <dependencies>
         <dependency>

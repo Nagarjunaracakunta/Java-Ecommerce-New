@@ -21,6 +21,21 @@ services:
     networks:
       - ecommerce-network
 
+  jenkins:
+    build: ./jenkins
+    container_name: jenkins
+    ports:
+      - "8090:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /Users/nagarjunar/Java-Ecommerce-New:/var/jenkins_home/project
+      - /Users/nagarjunar/.m2:/var/jenkins_home/.m2
+    networks:
+      - ecommerce-network
+    depends_on:
+      - sonarqube
+
 networks:
   ecommerce-network:
     driver: bridge
@@ -29,3 +44,4 @@ volumes:
   sonarqube_data:
   sonarqube_logs:
   sonarqube_extensions:
+  jenkins_home:

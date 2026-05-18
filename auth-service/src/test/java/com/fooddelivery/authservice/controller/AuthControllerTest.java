@@ -5,8 +5,10 @@ import com.fooddelivery.authservice.authservice.AuthService;
 import com.fooddelivery.authservice.dto.LoginRequest;
 import com.fooddelivery.authservice.dto.LoginResponse;
 import com.fooddelivery.authservice.dto.RegisterRequest;
+import com.fooddelivery.authservice.config.JwtAuthFilter;
 import com.fooddelivery.authservice.config.SecurityConfig;
 import com.fooddelivery.authservice.exception.GlobalExceptionHandler;
+import com.fooddelivery.authservice.util.JwtUtil;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
@@ -25,7 +27,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @WebMvcTest(AuthController.class)
-@Import({SecurityConfig.class, GlobalExceptionHandler.class})
+@Import({SecurityConfig.class, JwtAuthFilter.class, JwtUtil.class, GlobalExceptionHandler.class})
 class AuthControllerTest {
 
     @Autowired

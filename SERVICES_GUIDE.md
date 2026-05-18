@@ -111,23 +111,52 @@ Runs on port 8080. Every client request hits the gateway first — it handles ro
 ```
 api-gateway/
 ├── config/
-│   ├── GatewayConfig.java       — WebClient bean (16 MB buffer for proxied responses)
-│   └── RouteProperties.java     — @ConfigurationProperties: gateway.routes map
+│   ├── GatewayConfig.java         — WebClient bean (16 MB buffer for proxied responses)
+│   ├── RateLimitProperties.java   — @ConfigurationProperties: rate-limit.routes map
+│   └── RouteProperties.java       — @ConfigurationProperties: gateway.routes map
 ├── filter/
-│   └── RoutingFilter.java       — WebFilter: path-prefix routing + full proxy
+│   ├── RequestLoggingFilter.java  — @Order(-10) structured req/res logging + timing
+│   ├── CorsFilter.java            — @Order(-4)  CORS headers + OPTIONS preflight
+│   ├── RateLimitFilter.java       — @Order(-2)  per-IP token-bucket throttling
+│   ├── JwtAuthFilter.java         — @Order(-1)  JWT validation + identity headers
+│   └── RoutingFilter.java         — @Order(MAX) path-prefix proxy + error handling
+├── ratelimit/
+│   └── TokenBucket.java           — thread-safe token bucket (continuous refill)
+├── util/
+│   └── JwtUtil.java               — verify + extract only (no token generation)
 └── src/main/resources/
-    └── application.yml          — port 8080, route table, jwt.secret, logging
+    └── application.yml            — port 8080, routes, jwt.secret, rate limits, logging
 ```
 
-**Step-by-step build plan:**
+### Complete filter chain
 
-| Step | What it adds | Status |
-|---|---|---|
-| 1 | Basic routing — proxy requests to auth-service / product-service | Done |
-| 2 | JWT validation filter — protect non-public routes | Next |
-| 3 | Forward X-Username / X-User-Role headers to downstream services | Planned |
-| 4 | Rate limiting per route | Planned |
-| 5 | CORS, request logging, uniform error format | Planned |
+```
+Incoming request :8080
+  │
+  ▼  @Order(-10)  RequestLoggingFilter  → logs "→ METHOD path client=IP"
+  │  @Order(-4)   CorsFilter            → adds Access-Control-* headers
+  │                                        OPTIONS preflight → 200 immediately
+  │  @Order(-2)   RateLimitFilter       → token bucket per (IP, route prefix)
+  │                                        bucket empty → 429 JSON
+  │  @Order(-1)   JwtAuthFilter         → public route → pass through
+  │                                        missing/bad token → 401 JSON
+  │                                        valid token → mutate request, add headers
+  │  @Order(MAX)  RoutingFilter         → prefix match → WebClient forward
+  │                                        no match → 404
+  │                                        backend down → 503 JSON
+  │                                        gateway error → 502 JSON
+  ▼  @Order(-10)  RequestLoggingFilter  → logs "← STATUS METHOD path Xms"
+```
+
+**Step-by-step build status:**
+
+| Step | What it adds | Files | Status |
+|---|---|---|---|
+| 1 | Basic routing | RouteProperties, GatewayConfig, RoutingFilter | Done |
+| 2 | JWT validation | JwtUtil, JwtAuthFilter | Done |
+| 3 | Identity header forwarding | JwtAuthFilter (mutate) | Done |
+| 4 | Rate limiting | RateLimitProperties, TokenBucket, RateLimitFilter | Done |
+| 5 | CORS, logging, error format | CorsFilter, RequestLoggingFilter, RoutingFilter (onErrorResume) | Done |
 
 ---
 
@@ -236,43 +265,449 @@ The client sends `Host: localhost:8080` (the gateway). If forwarded as-is, some 
 
 ---
 
-## 6. api-gateway — Step Roadmap
+## 6. api-gateway — All 5 Steps: Build Guide, Challenges, and Testing
 
-### Step 1 — Basic routing (Done)
-Gateway starts on port 8080. Any request matching a configured prefix is forwarded to the backend. Unmatched paths return 404.
+---
+
+### Step 1 — Basic Routing
+
+**What was built:**
+`RoutingFilter` reads a `gateway.routes` map from `application.yml`, matches the request path against prefixes, and proxies the full request (method + headers + body) to the backend using `WebClient`.
+
+**Key files:**
+- `RouteProperties.java` — `@ConfigurationProperties(prefix="gateway")` binds the routes map
+- `GatewayConfig.java` — `WebClient` bean with 16 MB buffer (for large JSON responses)
+- `RoutingFilter.java` — implements `WebFilter`, runs at `LOWEST_PRECEDENCE - 10`
+
+**application.yml:**
+```yaml
+gateway:
+  routes:
+    "[/auth]": http://localhost:8081
+    "[/products]": http://localhost:8082
+```
+
+**Design decisions:**
+- `@Order(LOWEST_PRECEDENCE - 10)` — routing runs LAST so every other filter (auth, rate limit) can short-circuit before the backend is ever called
+- `exchangeToMono` instead of `retrieve()` — `retrieve()` throws on 4xx/5xx responses; the gateway must be a transparent proxy and pass backend error codes through unchanged
+- Remove `HOST` header — client sends `Host: localhost:8080`; if forwarded, backends that do Host validation reject it
+
+---
+
+**Challenge 1A — Spring Cloud incompatible with Spring Boot 4.0.6**
+
+Initial plan was to use `spring-cloud-starter-gateway`. After adding the dependency, startup failed with:
+
+```
+ClassNotFoundException: org.springframework.boot.autoconfigure.web.ServerProperties
+```
+
+Then after adding exclusions:
+```
+ClassNotFoundException: org.springframework.boot.web.context.WebServerInitializedEvent
+```
+
+**Root cause:** Spring Cloud 2025.0.0 was compiled against different Spring Boot 4.x internal classes that moved between patch versions. `spring.cloud.discovery.enabled=false` did not help because the failure happens during `@ConditionalOnMissingBean` evaluation before any property binding.
+
+**Fix:** Dropped Spring Cloud entirely. Replaced with `spring-boot-starter-webflux` + a custom `WebFilter` proxy — only ~70 lines, zero extra dependencies, full control.
+
+---
+
+**Challenge 1B — Routes map keys not matching**
+
+After writing the route config as:
+```yaml
+gateway:
+  routes:
+    /auth: http://localhost:8081
+```
+The log showed `No route matched for path: /auth` even though the path clearly started with `/auth`.
+
+**Root cause:** Spring Boot's relaxed binding normalizes map keys. A key containing `/` has the slash treated as a path separator, so the key arrives in the map as an empty string or gets mangled.
+
+**Fix:** Bracket notation forces Spring to bind the key exactly as written:
+```yaml
+gateway:
+  routes:
+    "[/auth]": http://localhost:8081
+```
+
+---
+
+**Testing Step 1:**
+```bash
+# Start auth-service (:8081) and product-service (:8082), then start gateway (:8080)
+
+# Should forward to product-service and return product list
+curl http://localhost:8080/products
+
+# Should return 404 — no route configured for /unknown
+curl http://localhost:8080/unknown
+
+# Expected gateway DEBUG log:
+# Routing GET /products → http://localhost:8082/products
+# No route matched for path: /unknown
+```
+
+---
+
+### Step 2 — JWT Validation Filter
+
+**What was built:**
+`JwtAuthFilter` runs at `@Order(-1)` — before `RoutingFilter`. It checks a public-route whitelist and, for protected routes, validates the `Authorization: Bearer <token>` header. Invalid or missing → 401 JSON before the backend is called.
+
+**Key files:**
+- `JwtUtil.java` — verify + extract only, same JJWT 0.12.6 API as auth-service and product-service
+- `JwtAuthFilter.java` — `@Order(-1)`, public whitelist as a list of `(HttpMethod, pathPrefix)` records
+
+**Public whitelist:**
+```java
+private static final List<PublicRoute> PUBLIC_ROUTES = List.of(
+    new PublicRoute(HttpMethod.POST, "/auth/login"),
+    new PublicRoute(HttpMethod.POST, "/auth/register"),
+    new PublicRoute(HttpMethod.GET,  "/products")   // all GET /products/** are public
+);
+```
+
+**Design decisions:**
+- `@Order(-1)` — runs before routing (`LOWEST_PRECEDENCE - 10`) so 401 stops the request before `WebClient` makes any network call
+- `isTokenValid()` is fail-safe — catches `JwtException` and returns `false` instead of throwing; the filter converts that to a clean 401
+- Public routes skip JWT entirely — no header required even if one happens to be present
+
+**Why the JWT secret is also in api-gateway:**
+The gateway needs to verify the signature. It uses the same `jwt.secret` value as auth-service and product-service — all three share the secret but the gateway never generates tokens, only verifies them.
+
+---
+
+**Challenge 2 — Correct filter ordering**
+
+`WebFilter` order in Spring WebFlux: **lower number = higher priority = runs first**.
+
+| Filter | Order | Runs |
+|---|---|---|
+| `RequestLoggingFilter` | -10 | First (outermost) |
+| `CorsFilter` | -4 | Second |
+| `RateLimitFilter` | -2 | Third |
+| `JwtAuthFilter` | -1 | Fourth |
+| `RoutingFilter` | `MAX - 10` | Last |
+
+If JwtAuthFilter were at a higher number (lower priority) than RoutingFilter, the request would be forwarded to the backend before the token is checked — defeating the purpose.
+
+---
+
+**Testing Step 2:**
+```bash
+# 1. Public route — no token needed
+curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/products
+# → 200
+
+# 2. Protected route — no token
+curl -s -X DELETE http://localhost:8080/products/1
+# → {"error":"Unauthorized","message":"Authorization header missing or not Bearer"}
+
+# 3. Protected route — bad token
+curl -s -X DELETE http://localhost:8080/products/1 \
+  -H "Authorization: Bearer bad.token.here"
+# → {"error":"Unauthorized","message":"Token invalid or expired"}
+
+# 4. Protected route — real token (get one from auth-service first)
+TOKEN=$(curl -s -X POST http://localhost:8081/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"password123"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+curl -s -X DELETE http://localhost:8080/products/1 \
+  -H "Authorization: Bearer $TOKEN"
+# → forwarded to product-service (403 if not admin, 204 if admin)
+```
+
+---
+
+### Step 3 — Forward Identity Headers
+
+**What was built:**
+After validating the JWT, `JwtAuthFilter` extracts `username` and `role` from the token and injects them as `X-Username` and `X-User-Role` headers. `RoutingFilter` already forwards all headers — no changes needed there.
+
+**Key change in JwtAuthFilter:**
+```java
+String username = jwtUtil.extractUsername(token);
+String role     = jwtUtil.extractRole(token);
+
+ServerWebExchange enriched = exchange.mutate()
+        .request(r -> r.headers(h -> {
+            h.set("X-Username",  username);
+            h.set("X-User-Role", role);
+        }))
+        .build();
+
+return chain.filter(enriched);   // pass the mutated exchange, not the original
+```
+
+**Why downstream services benefit:**
+- product-service currently validates the JWT itself (`JwtAuthFilter` + `JwtUtil`)
+- Once network-isolated (Docker/K8s), it can be replaced by a simple header-reader — no JJWT dependency needed
+- cart-service, order-service built from the start to read `X-Username` from headers — no JWT at all
+
+---
+
+**Challenge 3 — WebFlux requests are immutable**
+
+In WebMVC, you can modify `HttpServletRequest` attributes freely. In WebFlux, `ServerHttpRequest` is **immutable** — calling a setter on headers throws an `UnsupportedOperationException`.
+
+**Fix:** `exchange.mutate()` creates a new `ServerWebExchange` with the modified request. The original exchange is unchanged. The mutated exchange is what you pass to `chain.filter()`.
+
+```java
+// WRONG — immutable, throws UnsupportedOperationException
+exchange.getRequest().getHeaders().set("X-Username", username);
+
+// CORRECT — create a new exchange with modified headers
+ServerWebExchange enriched = exchange.mutate()
+    .request(r -> r.headers(h -> h.set("X-Username", username)))
+    .build();
+return chain.filter(enriched);
+```
+
+---
+
+**Testing Step 3:**
+```bash
+# Get a token, then make a protected request
+# The backend service will receive X-Username and X-User-Role headers
+# Verify by checking product-service logs for the username it received
+
+TOKEN=$(curl -s -X POST http://localhost:8081/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"password123"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+# Gateway debug log will show:
+# JwtAuthFilter: JWT valid for POST /products — user: alice, role: ROLE_USER
+# RoutingFilter: Routing POST /products → http://localhost:8082/products
+# product-service will receive: X-Username: alice, X-User-Role: ROLE_USER
+curl -s -X POST http://localhost:8080/products \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Test","description":"test","price":9.99,"stock":5,"category":"MAIN_COURSE"}'
+```
+
+---
+
+### Step 4 — Rate Limiting
+
+**What was built:**
+`RateLimitFilter` runs at `@Order(-2)`. It maintains one `TokenBucket` per `(clientIP, route prefix)` in a `ConcurrentHashMap`. Each request consumes one token. When the bucket is empty → 429 with `Retry-After: 60` and `X-Rate-Limit-Limit` headers.
+
+**Configured limits:**
+```yaml
+rate-limit:
+  routes:
+    "[/auth/login]": 5      # brute-force protection
+    "[/auth/register]": 10  # account farming prevention
+    "[/products]": 100      # normal API traffic
+  default-requests-per-minute: 60
+```
+
+**Token bucket algorithm:**
+```java
+public synchronized boolean tryConsume() {
+    refill();           // add tokens based on elapsed time
+    if (tokens >= 1.0) {
+        tokens -= 1.0;
+        return true;    // request allowed
+    }
+    return false;       // bucket empty → 429
+}
+
+private void refill() {
+    long now   = System.currentTimeMillis();
+    double add = (now - lastRefillTime) * refillRatePerMs;
+    tokens         = Math.min(capacity, tokens + add);  // never exceed capacity
+    lastRefillTime = now;
+}
+```
+
+**Why rate limiting runs BEFORE JWT validation (`@Order -2` not `-3`):**
+Dropping abusive traffic at the rate limiter means JWT parsing never happens for flood requests. This is intentional — JWT parsing is relatively expensive. The most aggressive limit (`/auth/login: 5/min`) protects against brute-force attacks where no valid token exists anyway.
+
+**Why `X-Forwarded-For` is respected:**
+When the gateway runs behind a load balancer, `getRemoteAddress()` returns the load balancer's IP, not the real client. `X-Forwarded-For` carries the original client IP.
+
+---
+
+**Challenge 4 — Thread safety of the token bucket**
+
+`ConcurrentHashMap` is thread-safe for `put`/`get`, but `TokenBucket.tryConsume()` involves a read-modify-write sequence (read tokens → refill → subtract → write). In the reactive event loop, multiple concurrent requests for the same client can race on the same bucket.
+
+**Fix:** `synchronized` on `tryConsume()`. The lock is per-bucket (one object per client+route), so it only serializes requests from the same client to the same route — not the whole map.
+
+```java
+public synchronized boolean tryConsume() { ... }
+```
+
+---
+
+**Testing Step 4:**
+```bash
+# Fire 7 rapid requests to /auth/login (limit = 5)
+# First 5 should pass (401 from auth-service — wrong credentials, but reached backend)
+# Requests 6 and 7 should get 429 from the gateway
+
+for i in $(seq 1 7); do
+  CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"username":"x","password":"y"}')
+  echo "Request $i → HTTP $CODE"
+done
+
+# Expected:
+# Request 1 → HTTP 401  (reached auth-service, wrong credentials)
+# Request 2 → HTTP 401
+# Request 3 → HTTP 401
+# Request 4 → HTTP 401
+# Request 5 → HTTP 401
+# Request 6 → HTTP 429  (rate limit hit — gateway stops here)
+# Request 7 → HTTP 429
+
+# Gateway WARN log for requests 6+:
+# Rate limit exceeded — client: 127.0.0.1, route: /auth/login, limit: 5/min
+
+# Check the 429 response body and headers
+curl -v -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{}' 2>&1 | grep -E "429|Retry-After|X-Rate-Limit|Too Many"
+```
+
+---
+
+### Step 5 — CORS, Request Logging, Uniform Error Format
+
+**What was built — three independent additions:**
+
+#### 5a. CorsFilter (`@Order(-4)`)
+
+Adds `Access-Control-*` headers to **every** response — including 401 and 429. Without this, a browser receiving a 401 cannot read the JSON error body because the CORS headers are missing.
+
+Handles `OPTIONS` preflight in the gateway itself (returns 200 immediately) — the backend never needs to know about CORS:
+```java
+if (HttpMethod.OPTIONS.equals(exchange.getRequest().getMethod())) {
+    response.setStatusCode(HttpStatus.OK);
+    return response.setComplete();  // 1ms, backend not called
+}
+```
+
+#### 5b. RequestLoggingFilter (`@Order(-10)`)
+
+Outermost filter — wraps the entire pipeline to measure true end-to-end time:
+```
+→ GET /products client=127.0.0.1          (on arrival)
+← 200 GET /products 631ms                 (on completion, including backend time)
+← 429 POST /auth/login 1ms                (rate-limited — never reached backend)
+```
+
+Uses `doFinally(signal -> ...)` — fires after the reactive chain completes regardless of success or error.
+
+#### 5c. Backend error handling in RoutingFilter
+
+`WebClient` throws `WebClientRequestException` when the backend is unreachable. Without handling, Netty emits a raw stack trace to the client. With `.onErrorResume()`:
+
+```java
+.onErrorResume(ex -> backendError(exchange, ex))
+
+// backendError():
+// WebClientRequestException (connection refused) → 503 Service Unavailable
+// anything else                                 → 502 Bad Gateway
+// response: {"error":"Service Unavailable","message":"Backend service is not available","path":"/products"}
+```
+
+---
+
+**Challenge 5A — CORS must wrap all other filters**
+
+Initial placement of `CorsFilter` at `@Order(-1)` meant 401 and 429 responses sent before it ran had no CORS headers — browsers could not read the error body.
+
+**Fix:** Move `CorsFilter` to `@Order(-4)` — runs after logging but before rate-limiting and JWT. Every response that goes back up the chain passes through it.
+
+---
+
+**Challenge 5B — OPTIONS preflight must never reach the backend**
+
+If a browser sends `OPTIONS /products/1` and the gateway forwards it to product-service, the product-service (running Spring Security) has no CORS config and returns 403. The browser sees a failed preflight and blocks the real request.
+
+**Fix:** `CorsFilter` intercepts `OPTIONS` and returns 200 immediately — `RoutingFilter` never runs for preflight requests.
+
+---
+
+**Testing Step 5:**
+```bash
+# 1. Structured logging — watch the gateway console while making requests
+curl http://localhost:8080/products
+# Gateway INFO logs:
+# → GET /products client=0:0:0:0:0:0:0:1
+# ← 200 GET /products 631ms
+
+# 2. CORS preflight
+curl -s -o /dev/null -w "%{http_code}" -X OPTIONS http://localhost:8080/products \
+  -H "Origin: http://localhost:3000" \
+  -H "Access-Control-Request-Method: POST"
+# → 200 (1ms — backend never called)
+
+# 3. CORS headers on all responses (including 401)
+curl -s -I -X DELETE http://localhost:8080/products/1 | grep -i "access-control"
+# access-control-allow-origin: *
+# access-control-allow-methods: GET, POST, PUT, DELETE, OPTIONS, PATCH
+# access-control-allow-headers: Authorization, Content-Type, X-Requested-With
+
+# 4. Backend-down error format — stop product-service first
+# kill $(lsof -ti :8082)
+curl http://localhost:8080/products
+# → {"error":"Service Unavailable","message":"Backend service is not available","path":"/products"}
+# Gateway ERROR log:
+# Backend error [/products → 503 SERVICE_UNAVAILABLE]: Connection refused: localhost/[::1]:8082
+```
+
+---
+
+### Full end-to-end testing sequence
+
+Start services in order, then run:
 
 ```bash
-# Test routing (product-service must be running on :8082)
-curl http://localhost:8080/products
-# → forwarded to http://localhost:8082/products
+# Step 1 — Start all services
+# Terminal 1: cd auth-service    && mvn spring-boot:run
+# Terminal 2: cd product-service && mvn spring-boot:run
+# Terminal 3: cd api-gateway     && mvn spring-boot:run
 
-curl http://localhost:8080/unknown
-# → 404 from gateway (no route matched)
+# Step 2 — Get a token
+TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"password123"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+# Step 3 — Public read (no token)
+curl http://localhost:8080/products                        # 200 list
+
+# Step 4 — Protected write (admin token)
+curl -X POST http://localhost:8080/products \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Pizza","description":"Margherita","price":11.99,"stock":30,"category":"MAIN_COURSE"}'
+
+# Step 5 — Protected write (no token) → 401
+curl -X POST http://localhost:8080/products \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Step 6 — Rate limit brute-force (run 6 times fast → 6th gets 429)
+for i in $(seq 1 6); do
+  curl -s -o /dev/null -w "req $i → %{http_code}\n" \
+    -X POST http://localhost:8080/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"username":"x","password":"y"}'
+done
+
+# Step 7 — CORS preflight
+curl -s -o /dev/null -w "%{http_code}\n" -X OPTIONS http://localhost:8080/products \
+  -H "Origin: http://localhost:3000" \
+  -H "Access-Control-Request-Method: POST"   # → 200
 ```
-
-### Step 2 — JWT validation (Next)
-A `JwtAuthFilter` WebFilter runs before `RoutingFilter`. Public routes are whitelisted; all others require `Authorization: Bearer <token>`. Invalid/missing token → 401 before the request ever reaches the backend.
-
-Public whitelist:
-- `POST /auth/login`
-- `POST /auth/register`
-- `GET /products/**`
-
-### Step 3 — Forward identity headers
-After JWT validation, the gateway extracts `username` and `role` from the token and injects them as trusted headers:
-```
-X-Username: alice
-X-User-Role: ROLE_ADMIN
-```
-Downstream services read these headers instead of re-parsing the JWT.
-
-### Step 4 — Rate limiting
-Per-route token-bucket throttling (e.g., 100 req/s per IP on `/auth/login` to prevent brute-force).
-
-### Step 5 — Cross-cutting filters
-- CORS headers
-- Structured request/response logging
-- Uniform error response format (JSON `{error, status, path}`)
 
 ---
 
@@ -1772,6 +2207,83 @@ curl -X POST http://localhost:8081/auth/admin/promote/alice \
 ---
 
 ## 34. Common Errors and Fixes
+
+### api-gateway: ClassNotFoundException on startup with Spring Cloud
+```
+ClassNotFoundException: org.springframework.boot.autoconfigure.web.ServerProperties
+ClassNotFoundException: org.springframework.boot.web.context.WebServerInitializedEvent
+```
+**Cause:** Spring Cloud 2025.0.0 compiled against different Spring Boot 4.x internal classes that moved between patch versions. `spring.cloud.discovery.enabled=false` does not help because the failure happens in `@ConditionalOnMissingBean` evaluation before properties are bound.
+**Fix:** Drop Spring Cloud entirely. Use `spring-boot-starter-webflux` with a custom `WebFilter` proxy — zero extra dependencies.
+
+---
+
+### api-gateway: No route matched — routes map empty despite correct config
+```
+DEBUG RoutingFilter: No route matched for path: /products
+```
+**Cause:** YAML map keys containing `/` are mangled by Spring Boot's relaxed binding. `/products` arrives in the map as an empty string.
+**Fix:** Bracket notation preserves the key exactly:
+```yaml
+gateway:
+  routes:
+    "[/products]": http://localhost:8082   # correct
+    /products: http://localhost:8082       # wrong — key arrives mangled
+```
+
+---
+
+### api-gateway: UnsupportedOperationException when adding headers
+```
+java.lang.UnsupportedOperationException
+  at org.springframework.http.ReadOnlyHttpHeaders.set(...)
+```
+**Cause:** `ServerHttpRequest` headers are immutable in WebFlux. You cannot call `exchange.getRequest().getHeaders().set(...)`.
+**Fix:** Use `exchange.mutate()` to create a new exchange with the modified headers:
+```java
+ServerWebExchange enriched = exchange.mutate()
+    .request(r -> r.headers(h -> h.set("X-Username", username)))
+    .build();
+return chain.filter(enriched);
+```
+
+---
+
+### api-gateway: Browser cannot read 401/429 error body (CORS blocked)
+**Cause:** `CorsFilter` was ordered after `JwtAuthFilter` / `RateLimitFilter`. Responses that short-circuit before `CorsFilter` runs carry no `Access-Control-Allow-Origin` header — browsers block the response entirely.
+**Fix:** `CorsFilter` must be at a lower order number (higher priority) than all other filters:
+```java
+@Order(-4)  // correct — runs before RateLimitFilter (-2) and JwtAuthFilter (-1)
+public class CorsFilter implements WebFilter { ... }
+```
+
+---
+
+### api-gateway: OPTIONS preflight returns 403 (product-service rejects it)
+**Cause:** `CorsFilter` was not short-circuiting preflight — `OPTIONS` requests were forwarded to product-service, which has no CORS config and rejects them with 403.
+**Fix:** Return 200 immediately for `OPTIONS` inside `CorsFilter`, never call `chain.filter()`:
+```java
+if (HttpMethod.OPTIONS.equals(exchange.getRequest().getMethod())) {
+    response.setStatusCode(HttpStatus.OK);
+    return response.setComplete();   // gateway handles it — backend never called
+}
+```
+
+---
+
+### api-gateway: Backend-down gives raw Netty error to client
+```
+reactor.netty.http.client.PrematureCloseException: Connection has been closed BEFORE response...
+```
+**Cause:** No error handling on the `WebClient` call in `RoutingFilter`. Exception bubbles to the client as a 500 with a stack trace.
+**Fix:** Add `.onErrorResume()` to `RoutingFilter`:
+```java
+.onErrorResume(ex -> backendError(exchange, ex))
+// WebClientRequestException → 503 {"error":"Service Unavailable",...}
+// other exceptions          → 502 {"error":"Bad Gateway",...}
+```
+
+---
 
 ### @SpringBootTest fails — no DataSource configured
 ```

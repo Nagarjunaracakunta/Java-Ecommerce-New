@@ -16,6 +16,18 @@ gateway:
 jwt:
   secret: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
 
+# Per-route rate limits (requests per minute per client IP)
+# /auth/login is strict — brute-force protection
+# /auth/register is moderate — prevent account farming
+# /products is loose — normal API traffic
+# anything else uses default-requests-per-minute
+rate-limit:
+  routes:
+    "[/auth/login]": 5
+    "[/auth/register]": 10
+    "[/products]": 100
+  default-requests-per-minute: 60
+
 logging:
   level:
     com.fooddelivery.apigateway: DEBUG

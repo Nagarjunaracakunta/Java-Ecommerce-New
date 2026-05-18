@@ -12,6 +12,10 @@ gateway:
     "[/auth]": http://localhost:8081
     "[/products]": http://localhost:8082
 
+# Shared JWT secret — same value across auth-service, product-service, api-gateway
+jwt:
+  secret: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+
 logging:
   level:
     com.fooddelivery.apigateway: DEBUG

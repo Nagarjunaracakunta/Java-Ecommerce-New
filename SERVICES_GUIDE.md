@@ -1,5 +1,5 @@
 # Java Ecommerce — Services Guide
-# product-service · auth-service · JWT · Spring Security · Validations · Design Patterns
+# api-gateway · auth-service · product-service · JWT · Spring Security · Validations · Design Patterns
 
 ---
 
@@ -8,39 +8,46 @@
 **Multi-Module**
 1. [Multi-Module Project Structure](#1-multi-module-project-structure)
 
+**api-gateway**
+2. [api-gateway — Overview and Design](#2-api-gateway--overview-and-design)
+3. [api-gateway — Why WebFlux, Not WebMVC](#3-api-gateway--why-webflux-not-webmvc)
+4. [api-gateway — Route Configuration](#4-api-gateway--route-configuration)
+5. [api-gateway — RoutingFilter: The Proxy](#5-api-gateway--routingfilter-the-proxy)
+6. [api-gateway — Step Roadmap](#6-api-gateway--step-roadmap)
+
 **product-service**
-2. [product-service — Overview and Structure](#2-product-service--overview-and-structure)
-3. [product-service — Dependencies](#3-product-service--dependencies)
-4. [product-service — Entity and Category Design](#4-product-service--entity-and-category-design)
-5. [product-service — Validations (Complete Guide)](#5-product-service--validations-complete-guide)
-6. [product-service — Role-Based Security](#6-product-service--role-based-security)
-7. [product-service — JWT Flow: How Auth and Product Services Communicate](#7-product-service--jwt-flow-how-auth-and-product-services-communicate)
-8. [product-service — Immutable Objects](#8-product-service--immutable-objects)
-9. [product-service — Deep Copy vs Shallow Copy](#9-product-service--deep-copy-vs-shallow-copy)
-10. [product-service — Fail-Fast vs Fail-Safe](#10-product-service--fail-fast-vs-fail-safe)
-11. [product-service — Service Layer](#11-product-service--service-layer)
-12. [product-service — Controller and Exception Handler](#12-product-service--controller-and-exception-handler)
-13. [product-service — Testing Strategy](#13-product-service--testing-strategy)
-14. [product-service — API Usage with curl](#14-product-service--api-usage-with-curl)
+7. [product-service — Overview and Structure](#7-product-service--overview-and-structure)
+8. [product-service — Dependencies](#8-product-service--dependencies)
+9. [product-service — Entity and Category Design](#9-product-service--entity-and-category-design)
+10. [product-service — Validations (Complete Guide)](#10-product-service--validations-complete-guide)
+11. [product-service — Role-Based Security](#11-product-service--role-based-security)
+12. [product-service — JWT Flow: How Auth and Product Services Communicate](#12-product-service--jwt-flow-how-auth-and-product-services-communicate)
+13. [product-service — Immutable Objects](#13-product-service--immutable-objects)
+14. [product-service — Deep Copy vs Shallow Copy](#14-product-service--deep-copy-vs-shallow-copy)
+15. [product-service — Fail-Fast vs Fail-Safe](#15-product-service--fail-fast-vs-fail-safe)
+16. [product-service — Service Layer](#16-product-service--service-layer)
+17. [product-service — Controller and Exception Handler](#17-product-service--controller-and-exception-handler)
+18. [product-service — Testing Strategy](#18-product-service--testing-strategy)
+19. [product-service — API Usage with curl](#19-product-service--api-usage-with-curl)
 
 **auth-service**
-15. [auth-service — Overview](#15-auth-service--overview)
-16. [auth-service — Dependencies](#16-auth-service--dependencies)
-17. [auth-service — Database Setup](#17-auth-service--database-setup)
-18. [auth-service — Entity and Repository](#18-auth-service--entity-and-repository)
-19. [auth-service — DTOs as Java Records](#19-auth-service--dtos-as-java-records)
-20. [auth-service — JWT Implementation](#20-auth-service--jwt-implementation)
-21. [auth-service — Security Filter](#21-auth-service--security-filter)
-22. [auth-service — Security Config](#22-auth-service--security-config)
-23. [auth-service — Service Layer](#23-auth-service--service-layer)
-24. [auth-service — Controller and Exception Handler](#24-auth-service--controller-and-exception-handler)
-25. [auth-service — Testing Strategy](#25-auth-service--testing-strategy)
-26. [auth-service — Test Setup](#26-auth-service--test-setup)
-27. [Creating the First Admin User](#27-creating-the-first-admin-user)
-28. [auth-service — API Usage with curl](#28-auth-service--api-usage-with-curl)
+20. [auth-service — Overview](#20-auth-service--overview)
+21. [auth-service — Dependencies](#21-auth-service--dependencies)
+22. [auth-service — Database Setup](#22-auth-service--database-setup)
+23. [auth-service — Entity and Repository](#23-auth-service--entity-and-repository)
+24. [auth-service — DTOs as Java Records](#24-auth-service--dtos-as-java-records)
+25. [auth-service — JWT Implementation](#25-auth-service--jwt-implementation)
+26. [auth-service — Security Filter](#26-auth-service--security-filter)
+27. [auth-service — Security Config](#27-auth-service--security-config)
+28. [auth-service — Service Layer](#28-auth-service--service-layer)
+29. [auth-service — Controller and Exception Handler](#29-auth-service--controller-and-exception-handler)
+30. [auth-service — Testing Strategy](#30-auth-service--testing-strategy)
+31. [auth-service — Test Setup](#31-auth-service--test-setup)
+32. [Creating the First Admin User](#32-creating-the-first-admin-user)
+33. [auth-service — API Usage with curl](#33-auth-service--api-usage-with-curl)
 
 **Errors**
-29. [Common Errors and Fixes](#29-common-errors-and-fixes)
+34. [Common Errors and Fixes](#34-common-errors-and-fixes)
 
 ---
 
@@ -51,17 +58,19 @@ The root project is a Maven aggregator that owns all child modules.
 ```
 Java-Ecommerce-New/           ← root aggregator (pom packaging)
 ├── pom.xml                   ← parent pom — shared plugins, properties
-├── product-service/          ← child module (port 8082)
+├── api-gateway/              ← child module (port 8080) — entry point
 │   └── pom.xml
-└── auth-service/             ← child module (port 8081)
+├── auth-service/             ← child module (port 8081)
+│   └── pom.xml
+└── product-service/          ← child module (port 8082)
     └── pom.xml
 ```
 
-### Planned full architecture (startup order)
+### Full architecture (startup order)
 ```
 auth-service        (port 8081) — user login, JWT issue
 product-service     (port 8082) — product CRUD
-api-gateway         (port 8080) — routing, JWT validation, rate limiting
+api-gateway         (port 8080) — routing, JWT validation, rate limiting  ← BUILT
 cart-service        (port 8083)
 order-service       (port 8084)
 payment-service     (port 8085)
@@ -73,8 +82,9 @@ notification-service(port 8087)
 ```xml
 <packaging>pom</packaging>
 <modules>
-    <module>product-service</module>
+    <module>api-gateway</module>
     <module>auth-service</module>
+    <module>product-service</module>
 </modules>
 ```
 
@@ -94,7 +104,179 @@ cd product-service && mvn clean package
 
 ---
 
-## 2. product-service — Overview and Structure
+## 2. api-gateway — Overview and Design
+
+Runs on port 8080. Every client request hits the gateway first — it handles routing, JWT validation, and cross-cutting concerns so downstream services don't need to duplicate that logic.
+
+```
+api-gateway/
+├── config/
+│   ├── GatewayConfig.java       — WebClient bean (16 MB buffer for proxied responses)
+│   └── RouteProperties.java     — @ConfigurationProperties: gateway.routes map
+├── filter/
+│   └── RoutingFilter.java       — WebFilter: path-prefix routing + full proxy
+└── src/main/resources/
+    └── application.yml          — port 8080, route table, jwt.secret, logging
+```
+
+**Step-by-step build plan:**
+
+| Step | What it adds | Status |
+|---|---|---|
+| 1 | Basic routing — proxy requests to auth-service / product-service | Done |
+| 2 | JWT validation filter — protect non-public routes | Next |
+| 3 | Forward X-Username / X-User-Role headers to downstream services | Planned |
+| 4 | Rate limiting per route | Planned |
+| 5 | CORS, request logging, uniform error format | Planned |
+
+---
+
+## 3. api-gateway — Why WebFlux, Not WebMVC
+
+The gateway uses `spring-boot-starter-webflux` (Netty, reactive). **Never add `spring-boot-starter-webmvc`** — the two stacks conflict on the same classpath.
+
+| | WebMVC (Servlet) | WebFlux (Reactive) |
+|---|---|---|
+| Thread model | 1 thread per request | Event loop — 1 thread handles thousands |
+| Blocking I/O | OK | Blocks the event loop — avoid |
+| Filter type | `javax.servlet.Filter` / `OncePerRequestFilter` | `WebFilter` (returns `Mono<Void>`) |
+| HTTP client | `RestTemplate` / `RestClient` | `WebClient` (non-blocking) |
+| Best for | CRUD services with JPA | Gateways, proxies, streaming |
+
+A gateway does almost nothing but forward requests — it spends all its time waiting for I/O. Reactive / non-blocking is the right model here.
+
+**Why no Spring Cloud Gateway?**
+Spring Cloud 2025.x compiled against different Spring Boot 4.x internal classes that were moved between patch versions, causing `ClassNotFoundException` on startup. The fix: drop Spring Cloud entirely. A `WebFilter` proxy with `WebClient` is only ~70 lines and has zero extra dependencies.
+
+---
+
+## 4. api-gateway — Route Configuration
+
+Routes live in `application.yml` and are bound to `RouteProperties` via `@ConfigurationProperties`:
+
+```yaml
+gateway:
+  routes:
+    "[/auth]": http://localhost:8081
+    "[/products]": http://localhost:8082
+```
+
+**Why bracket notation `"[/auth]"`?**
+Spring Boot's relaxed binding normalizes map keys — a key like `/auth` has its `/` treated as a path separator and the key arrives empty or wrong. Bracket notation bypasses normalization and preserves the key exactly as written.
+
+```java
+@Component
+@ConfigurationProperties(prefix = "gateway")
+public class RouteProperties {
+    private Map<String, String> routes = new LinkedHashMap<>();
+    public Map<String, String> getRoutes() { return routes; }
+    public void setRoutes(Map<String, String> routes) { this.routes = routes; }
+}
+```
+
+To add a new service, add one line to `application.yml` — no code change needed:
+```yaml
+"[/orders]": http://localhost:8084
+```
+
+---
+
+## 5. api-gateway — RoutingFilter: The Proxy
+
+`RoutingFilter` implements `WebFilter` and runs at `LOWEST_PRECEDENCE - 10` — after auth/rate-limiting filters are added in later steps.
+
+```java
+@Component
+@Order(Ordered.LOWEST_PRECEDENCE - 10)
+public class RoutingFilter implements WebFilter {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
+        String path = exchange.getRequest().getURI().getPath();
+
+        // 1. Match the longest prefix in the route table
+        String targetBase = routeProperties.getRoutes().entrySet().stream()
+                .filter(entry -> path.startsWith(entry.getKey()))
+                .map(Map.Entry::getValue)
+                .findFirst().orElse(null);
+
+        if (targetBase == null) {
+            exchange.getResponse().setStatusCode(HttpStatus.NOT_FOUND);
+            return exchange.getResponse().setComplete();   // 404 — no route
+        }
+
+        // 2. Build target URL preserving path + query string
+        String rawQuery = exchange.getRequest().getURI().getRawQuery();
+        String targetUrl = targetBase + path + (rawQuery != null ? "?" + rawQuery : "");
+
+        // 3. Forward: method, headers (minus HOST), body → stream response back
+        return webClient
+                .method(exchange.getRequest().getMethod())
+                .uri(URI.create(targetUrl))
+                .headers(h -> {
+                    h.addAll(exchange.getRequest().getHeaders());
+                    h.remove(HttpHeaders.HOST);   // backend has its own Host
+                })
+                .body(exchange.getRequest().getBody(), DataBuffer.class)
+                .exchangeToMono(clientResponse -> {
+                    ServerHttpResponse response = exchange.getResponse();
+                    response.setStatusCode(clientResponse.statusCode());
+                    response.getHeaders().addAll(clientResponse.headers().asHttpHeaders());
+                    return response.writeWith(clientResponse.bodyToFlux(DataBuffer.class));
+                });
+    }
+}
+```
+
+**Why remove the HOST header?**
+The client sends `Host: localhost:8080` (the gateway). If forwarded as-is, some backends reject it because it doesn't match their own host. Removing it lets the backend use its own default.
+
+**Why `exchangeToMono` instead of `retrieve()`?**
+`retrieve()` throws on 4xx/5xx. `exchangeToMono` passes the response through unchanged — the gateway is a transparent proxy and should never swallow a 404 or 401 that came from the backend.
+
+---
+
+## 6. api-gateway — Step Roadmap
+
+### Step 1 — Basic routing (Done)
+Gateway starts on port 8080. Any request matching a configured prefix is forwarded to the backend. Unmatched paths return 404.
+
+```bash
+# Test routing (product-service must be running on :8082)
+curl http://localhost:8080/products
+# → forwarded to http://localhost:8082/products
+
+curl http://localhost:8080/unknown
+# → 404 from gateway (no route matched)
+```
+
+### Step 2 — JWT validation (Next)
+A `JwtAuthFilter` WebFilter runs before `RoutingFilter`. Public routes are whitelisted; all others require `Authorization: Bearer <token>`. Invalid/missing token → 401 before the request ever reaches the backend.
+
+Public whitelist:
+- `POST /auth/login`
+- `POST /auth/register`
+- `GET /products/**`
+
+### Step 3 — Forward identity headers
+After JWT validation, the gateway extracts `username` and `role` from the token and injects them as trusted headers:
+```
+X-Username: alice
+X-User-Role: ROLE_ADMIN
+```
+Downstream services read these headers instead of re-parsing the JWT.
+
+### Step 4 — Rate limiting
+Per-route token-bucket throttling (e.g., 100 req/s per IP on `/auth/login` to prevent brute-force).
+
+### Step 5 — Cross-cutting filters
+- CORS headers
+- Structured request/response logging
+- Uniform error response format (JSON `{error, status, path}`)
+
+---
+
+## 7. product-service — Overview and Structure
 
 Runs on port 8082. Manages the product catalogue for the food delivery app.
 
@@ -127,11 +309,11 @@ product-service/
 |---|---|---|
 | auth-service | 8081 | Handles identity — runs first |
 | product-service | 8082 | Downstream service |
-| api-gateway | 8080 (future) | Entry point — faces the internet |
+| api-gateway | 8080 | Entry point — faces the internet |
 
 ---
 
-## 3. product-service — Dependencies
+## 8. product-service — Dependencies
 
 ```xml
 <!-- Core -->
@@ -203,7 +385,7 @@ product-service/
 
 ---
 
-## 4. product-service — Entity and Category Design
+## 9. product-service — Entity and Category Design
 
 ### Product entity
 ```java
@@ -291,7 +473,7 @@ private Category category;
 
 ---
 
-## 5. product-service — Validations (Complete Guide)
+## 10. product-service — Validations (Complete Guide)
 
 ### Two layers of validation
 
@@ -390,7 +572,7 @@ Client sends:  valid request, name already exists → service layer throws → 4
 
 ---
 
-## 6. product-service — Role-Based Security
+## 11. product-service — Role-Based Security
 
 ### Endpoint access rules
 
@@ -461,7 +643,7 @@ If you read the role from a request header like `X-Role: ADMIN`, any client can 
 
 ---
 
-## 7. product-service — JWT Flow: How Auth and Product Services Communicate
+## 12. product-service — JWT Flow: How Auth and Product Services Communicate
 
 ### The key concept — they never call each other
 
@@ -560,26 +742,26 @@ curl -X POST http://localhost:8082/products \
   -d '{"name":"Burger","description":"Classic","price":9.99,"stock":50,"category":"MAIN_COURSE"}'
 ```
 
-### Future state — API Gateway takes over JWT validation
+### Current architecture — API Gateway validates JWT once
 
-When the API Gateway is added, it validates the JWT once and passes user info as trusted headers to downstream services:
+The api-gateway validates the JWT on every request and forwards identity as trusted headers. Downstream services don't need to parse the token again:
 
 ```
-Client → API Gateway (validates JWT)
+Client → api-gateway :8080  (validates JWT, extracts user info)
               │
               ├── X-Username: alice
               ├── X-User-Role: ROLE_ADMIN
               │
-              ├──▶ product-service  (reads headers, no JWT needed)
-              ├──▶ cart-service     (reads headers, no JWT needed)
-              └──▶ order-service    (reads headers, no JWT needed)
+              ├──▶ product-service :8082  (reads headers, no JWT needed)
+              ├──▶ cart-service    :8083  (reads headers, no JWT needed)
+              └──▶ order-service   :8084  (reads headers, no JWT needed)
 ```
 
-This is why `JwtUtil` and `JwtAuthFilter` are kept in each service for now — they work standalone. Once the gateway is in place, these can be removed and replaced by a `GatewayHeaderFilter` that reads the trusted headers.
+`JwtUtil` and `JwtAuthFilter` remain in each service for standalone use (e.g., running without the gateway in dev). Once Step 3 of the gateway is complete, downstream services can drop JWT validation and read the trusted gateway headers instead via a lightweight `GatewayHeaderFilter`.
 
 ---
 
-## 8. product-service — Immutable Objects
+## 13. product-service — Immutable Objects
 
 ### Records are immutable by design
 
@@ -669,7 +851,7 @@ public record ProductResponse(List<String> tags, ...) {
 
 ---
 
-## 9. product-service — Deep Copy vs Shallow Copy
+## 14. product-service — Deep Copy vs Shallow Copy
 
 ### Shallow copy — copies references, not objects
 
@@ -721,7 +903,7 @@ The JPA-managed `Product` entities returned by the repository are in the persist
 
 ---
 
-## 10. product-service — Fail-Fast vs Fail-Safe
+## 15. product-service — Fail-Fast vs Fail-Safe
 
 ### Fail-Fast — detect and throw immediately
 
@@ -807,7 +989,7 @@ Never:
 
 ---
 
-## 11. product-service — Service Layer
+## 16. product-service — Service Layer
 
 ```java
 @Service
@@ -859,7 +1041,7 @@ public class ProductService {
 
 ---
 
-## 12. product-service — Controller and Exception Handler
+## 17. product-service — Controller and Exception Handler
 
 ### ProductController
 ```
@@ -959,7 +1141,7 @@ public class GlobalExceptionHandler {
 
 ---
 
-## 13. product-service — Testing Strategy
+## 18. product-service — Testing Strategy
 
 ### What to test
 
@@ -1061,7 +1243,7 @@ class ProductRepositoryTest {
 
 ---
 
-## 14. product-service — API Usage with curl
+## 19. product-service — API Usage with curl
 
 ### Browse products (no token needed)
 ```bash
@@ -1131,7 +1313,7 @@ curl -X POST http://localhost:8082/products \
 
 ---
 
-## 15. auth-service — Overview
+## 20. auth-service — Overview
 
 Runs on port 8081. Handles user registration, login with JWT token generation, and admin role promotion.
 
@@ -1161,7 +1343,7 @@ auth-service/
 
 ---
 
-## 16. auth-service — Dependencies
+## 21. auth-service — Dependencies
 
 ```xml
 <dependency>
@@ -1207,7 +1389,7 @@ auth-service/
 
 ---
 
-## 17. auth-service — Database Setup
+## 22. auth-service — Database Setup
 
 ### Why two application.properties files
 
@@ -1254,7 +1436,7 @@ jwt.expiration-ms=86400000
 
 ---
 
-## 18. auth-service — Entity and Repository
+## 23. auth-service — Entity and Repository
 
 ### Role enum
 ```java
@@ -1298,7 +1480,7 @@ Spring Data JPA generates the SQL from the method name — no `@Query` needed.
 
 ---
 
-## 19. auth-service — DTOs as Java Records
+## 24. auth-service — DTOs as Java Records
 
 ```java
 public record LoginRequest(@NotBlank String username, @NotBlank String password) {}
@@ -1322,7 +1504,7 @@ GET requests are cached, logged with the URL, and may have body dropped by proxi
 
 ---
 
-## 20. auth-service — JWT Implementation
+## 25. auth-service — JWT Implementation
 
 ### JwtUtil — sign and verify
 ```java
@@ -1361,7 +1543,7 @@ public class JwtUtil {
 
 ---
 
-## 21. auth-service — Security Filter
+## 26. auth-service — Security Filter
 
 ```java
 @Component
@@ -1390,7 +1572,7 @@ public class JwtAuthFilter extends OncePerRequestFilter {
 
 ---
 
-## 22. auth-service — Security Config
+## 27. auth-service — Security Config
 
 ```java
 @Configuration
@@ -1418,7 +1600,7 @@ CSRF is disabled because stateless JWTs don't use cookies. `@EnableMethodSecurit
 
 ---
 
-## 23. auth-service — Service Layer
+## 28. auth-service — Service Layer
 
 ```java
 @Service
@@ -1459,7 +1641,7 @@ Original code did `new UserEntity(username, password, ROLE_ADMIN)` — no ID, so
 
 ---
 
-## 24. auth-service — Controller and Exception Handler
+## 29. auth-service — Controller and Exception Handler
 
 ```
 POST /auth/login                    — open to everyone
@@ -1475,7 +1657,7 @@ POST /auth/admin/promote/{username} — requires ROLE_ADMIN
 
 ---
 
-## 25. auth-service — Testing Strategy
+## 30. auth-service — Testing Strategy
 
 | Class | Test type | Reason |
 |---|---|---|
@@ -1497,7 +1679,7 @@ Total: 29
 
 ---
 
-## 26. auth-service — Test Setup
+## 31. auth-service — Test Setup
 
 ### JwtUtilTest — inject @Value without Spring context
 ```java
@@ -1539,7 +1721,7 @@ class UserRepositoryTest { ... }
 
 ---
 
-## 27. Creating the First Admin User
+## 32. Creating the First Admin User
 
 The promote endpoint requires an existing admin — so the first admin must be inserted directly into the DB.
 
@@ -1566,7 +1748,7 @@ Login → get JWT → call `POST /auth/admin/promote/{username}` to promote futu
 
 ---
 
-## 28. auth-service — API Usage with curl
+## 33. auth-service — API Usage with curl
 
 ```bash
 # Register
@@ -1589,7 +1771,7 @@ curl -X POST http://localhost:8081/auth/admin/promote/alice \
 
 ---
 
-## 29. Common Errors and Fixes
+## 34. Common Errors and Fixes
 
 ### @SpringBootTest fails — no DataSource configured
 ```

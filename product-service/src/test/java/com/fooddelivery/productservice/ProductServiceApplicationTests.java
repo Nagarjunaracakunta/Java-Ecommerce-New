@@ -1,13 +1,12 @@
-package com.fooddelivery.javaecommercenew;
+package com.fooddelivery.productservice;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 
 @SpringBootTest
-class JavaEcommerceNewApplicationTests {
+class ProductServiceApplicationTests {
 
     @Test
     void contextLoads() {
     }
-
 }

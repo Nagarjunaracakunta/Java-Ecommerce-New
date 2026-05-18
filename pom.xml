@@ -17,7 +17,7 @@
     <description>Java-Ecommerce-New</description>
 
     <modules>
-        <module>main-service</module>
+        <module>product-service</module>
         <module>auth-service</module>
     </modules>
 

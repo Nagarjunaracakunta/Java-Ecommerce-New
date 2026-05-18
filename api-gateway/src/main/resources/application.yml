@@ -1,0 +1,17 @@
+spring:
+  application:
+    name: api-gateway
+
+server:
+  port: 8080
+
+# Route table — prefix → backend base URL
+# The routing filter matches request path prefixes and forwards to the right service
+gateway:
+  routes:
+    "[/auth]": http://localhost:8081
+    "[/products]": http://localhost:8082
+
+logging:
+  level:
+    com.fooddelivery.apigateway: DEBUG

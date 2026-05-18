@@ -56,6 +56,7 @@ public class AuthService {
     public void promoteToAdmin(String username) {
         UserEntity user = userRepository.findByUsername(username)
                 .orElseThrow(() -> new IllegalArgumentException("User not found: " + username));
-        userRepository.save(new UserEntity(user.getUsername(), user.getPassword(), Role.ROLE_ADMIN));
+        user.setRole(Role.ROLE_ADMIN);
+        userRepository.save(user);
     }
 }

@@ -34,10 +34,14 @@ pipeline {
 
     post {
         success {
-            echo 'Pipeline completed successfully!'
+            echo 'Pipeline completed successfully! All modules passed.'
         }
         failure {
-            echo 'Pipeline failed!'
+            echo "Pipeline failed at stage: ${env.STAGE_NAME}"
+            echo 'Check Console Output and look for [ERROR] or FAILURE in the Reactor Summary.'
+        }
+        unstable {
+            echo 'Pipeline is unstable — test failures detected. Check the Test Results tab.'
         }
     }
 }

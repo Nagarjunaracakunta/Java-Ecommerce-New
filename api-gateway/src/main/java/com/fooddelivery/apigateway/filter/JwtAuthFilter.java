@@ -67,9 +67,20 @@ public class JwtAuthFilter implements WebFilter {
             return unauthorized(exchange, "Token invalid or expired");
         }
 
-        log.debug("JWT valid for {} {} — user: {}, role: {}",
-                method, path, jwtUtil.extractUsername(token), jwtUtil.extractRole(token));
-        return chain.filter(exchange);
+        String username = jwtUtil.extractUsername(token);
+        String role     = jwtUtil.extractRole(token);
+
+        log.debug("JWT valid for {} {} — user: {}, role: {}", method, path, username, role);
+
+        // Mutate the request to add identity headers — RoutingFilter forwards all headers to the backend
+        ServerWebExchange enriched = exchange.mutate()
+                .request(r -> r.headers(h -> {
+                    h.set("X-Username",  username);
+                    h.set("X-User-Role", role);
+                }))
+                .build();
+
+        return chain.filter(enriched);
     }
 
     private boolean isPublic(HttpMethod method, String path) {

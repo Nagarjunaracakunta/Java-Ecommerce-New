@@ -6,3 +6,4 @@ gateway:
     "[/products]": http://product-service:8082
     "[/cart]": http://cart-service:8083
     "[/orders]": http://order-service:8084
+    "[/payments]": http://payment-service:8085

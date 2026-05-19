@@ -8,6 +8,7 @@ COPY product-service/pom.xml product-service/
 COPY api-gateway/pom.xml     api-gateway/
 COPY cart-service/pom.xml    cart-service/
 COPY order-service/pom.xml   order-service/
+COPY payment-service/pom.xml  payment-service/
 
 RUN mvn install -N -q
 RUN mvn dependency:go-offline -pl product-service -q

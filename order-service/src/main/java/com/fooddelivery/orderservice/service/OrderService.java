@@ -1,7 +1,9 @@
 package com.fooddelivery.orderservice.service;
 
 import com.fooddelivery.orderservice.client.CartClient;
+import com.fooddelivery.orderservice.client.PaymentClient;
 import com.fooddelivery.orderservice.dto.CartResponse;
+import com.fooddelivery.orderservice.dto.InitiatePaymentRequest;
 import com.fooddelivery.orderservice.dto.CreateOrderRequest;
 import com.fooddelivery.orderservice.dto.OrderItemResponse;
 import com.fooddelivery.orderservice.dto.OrderResponse;
@@ -21,10 +23,13 @@ public class OrderService {
 
     private final OrderRepository orderRepository;
     private final CartClient cartClient;
+    private final PaymentClient paymentClient;
 
-    public OrderService(OrderRepository orderRepository, CartClient cartClient) {
+    public OrderService(OrderRepository orderRepository, CartClient cartClient,
+                        PaymentClient paymentClient) {
         this.orderRepository = orderRepository;
         this.cartClient = cartClient;
+        this.paymentClient = paymentClient;
     }
 
     @Transactional
@@ -53,6 +58,10 @@ public class OrderService {
 
         // Clear cart only after order is persisted successfully
         cartClient.clearCart(username);
+
+        // Trigger payment asynchronously — order stays PENDING until Kafka event arrives
+        paymentClient.initiatePayment(
+                new InitiatePaymentRequest(saved.getId(), saved.getTotalAmount(), username));
 
         return toResponse(saved);
     }

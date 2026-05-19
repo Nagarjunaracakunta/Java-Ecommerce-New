@@ -1,5 +1,5 @@
 # Java Ecommerce — Services Guide
-# api-gateway · auth-service · product-service · cart-service · order-service · payment-service · JWT · Kafka · Redis
+# api-gateway · auth-service · product-service · cart-service · order-service · payment-service · notification-service · JWT · Kafka · Redis · MongoDB
 
 ---
 
@@ -76,9 +76,20 @@
 57. [payment-service — Complete Async Flow End-to-End](#57-payment-service--complete-async-flow-end-to-end)
 58. [payment-service — API Usage with curl](#58-payment-service--api-usage-with-curl)
 
+**notification-service**
+60. [notification-service — Overview and Structure](#60-notification-service--overview-and-structure)
+61. [notification-service — MongoDB Data Model](#61-notification-service--mongodb-data-model)
+62. [notification-service — Kafka Consumer](#62-notification-service--kafka-consumer)
+63. [notification-service — Service Layer](#63-notification-service--service-layer)
+64. [notification-service — Security Config](#64-notification-service--security-config)
+65. [notification-service — Controller](#65-notification-service--controller)
+66. [notification-service — Spring Boot 4 MongoDB Property Change](#66-notification-service--spring-boot-4-mongodb-property-change)
+67. [notification-service — API Usage with curl](#67-notification-service--api-usage-with-curl)
+
 **Errors**
 34. [Common Errors and Fixes (auth/product/gateway)](#34-common-errors-and-fixes)
 59. [Common Errors and Fixes (cart/order/payment/Kafka)](#59-common-errors-and-fixes-cartorderpaymentkafka)
+68. [Common Errors and Fixes (notification-service/MongoDB)](#68-common-errors-and-fixes-notification-servicemongodb)
 
 ---
 
@@ -4006,3 +4017,902 @@ docker exec ecommerce-kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server kafka:9092 --delete --topic payment-events
 # Kafka auto-creates it fresh on the next send
 ```
+
+---
+
+## 60. notification-service — Overview and Structure
+
+### What it does
+notification-service is a pure event-driven service. It never receives direct calls from other microservices. Instead, it sits on the same Kafka `payment-events` topic as order-service and independently consumes every payment event to build a per-user notification feed stored in MongoDB.
+
+### Full data flow
+```
+POST /orders (user)
+    │
+    ▼
+order-service          ── HTTP ──▶  payment-service
+    │                                     │
+    │                         processes payment
+    │                                     │
+    │                         publishes to Kafka
+    │                                     │
+    ▼                                     ▼
+order-service                   notification-service
+[PaymentEventConsumer]          [PaymentEventListener]
+updates Order to                saves Notification
+CONFIRMED/CANCELLED             to MongoDB
+                                     │
+                                     ▼
+                            GET /notifications (user)
+```
+
+Both order-service and notification-service use a separate Kafka consumer group, so each independently receives every message from `payment-events`. This is the fan-out pattern — one published event, multiple independent consumers.
+
+### Technology choices
+| Concern | Choice | Why |
+|---|---|---|
+| Database | MongoDB | Notifications are schema-flexible documents, not relational data. No joins needed. Natural fit for append-only event logs. |
+| Transport | Kafka consumer | Decoupled from payment-service. Notification delivery survives payment-service downtime. |
+| Auth | Spring Security + JWT | Reads the same JWT the user carries — no dedicated session or token exchange. |
+| Port | 8087 | Defined in `application.properties`, exposed in docker-compose |
+
+### Module structure
+```
+notification-service/
+├── pom.xml
+└── src/main/java/com/fooddelivery/notificationservice/
+    ├── NotificationServiceApplication.java   ← @EnableKafka + @EnableMongoAuditing
+    ├── config/
+    │   ├── KafkaConsumerConfig.java          ← explicit consumer factory (required in Spring Boot 4)
+    │   ├── SecurityConfig.java               ← stateless JWT security
+    │   └── JwtAuthFilter.java                ← reads JWT from Authorization header
+    ├── controller/
+    │   └── NotificationController.java       ← REST endpoints for users
+    ├── dto/
+    │   └── PaymentEvent.java                 ← mirrors payment-service's event record
+    ├── entity/
+    │   └── Notification.java                 ← MongoDB @Document
+    ├── exception/
+    │   └── GlobalExceptionHandler.java
+    ├── kafka/
+    │   └── PaymentEventListener.java         ← @KafkaListener on payment-events
+    ├── repository/
+    │   └── NotificationRepository.java       ← MongoRepository with derived queries
+    ├── service/
+    │   └── NotificationService.java          ← event handling + CRUD logic
+    └── util/
+        └── JwtUtil.java                      ← shared JWT parsing (same as other services)
+```
+
+### Application class
+```java
+@SpringBootApplication
+@EnableKafka            // required in Spring Boot 4 — activates @KafkaListener processing
+@EnableMongoAuditing    // required for @CreatedDate to populate on save
+public class NotificationServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(NotificationServiceApplication.class, args);
+    }
+}
+```
+
+**Why two separate annotations?**
+- `@EnableKafka` tells Spring to scan for `@KafkaListener` beans and wire up the listener container. Without it, `@KafkaListener` methods are silently ignored — no error, no consumer, no events received.
+- `@EnableMongoAuditing` tells Spring Data MongoDB to process `@CreatedDate` / `@LastModifiedDate` fields. Without it, those fields are never populated on save (they stay `null`).
+
+### Dependencies (pom.xml)
+```xml
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-mongodb</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.kafka</groupId>
+        <artifactId>spring-kafka</artifactId>
+    </dependency>
+    <!-- JWT parsing — same version as other services -->
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-api</artifactId>
+        <version>0.12.6</version>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-impl</artifactId>
+        <version>0.12.6</version>
+        <scope>runtime</scope>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-jackson</artifactId>
+        <version>0.12.6</version>
+        <scope>runtime</scope>
+    </dependency>
+</dependencies>
+```
+
+### Configuration files
+**`application.properties`** (local dev):
+```properties
+spring.application.name=notification-service
+server.port=8087
+
+spring.mongodb.uri=mongodb://localhost:27017/notificationdb
+
+jwt.secret=5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+
+spring.kafka.bootstrap-servers=localhost:9092
+
+logging.level.com.fooddelivery.notificationservice=DEBUG
+```
+
+**`application-docker.properties`** (Docker Compose):
+```properties
+spring.mongodb.uri=mongodb://mongodb:27017/notificationdb
+spring.kafka.bootstrap-servers=kafka:9092
+```
+
+> **Note:** The property is `spring.mongodb.uri` — not `spring.data.mongodb.uri`. In Spring Boot 4, the MongoDB property prefix changed. See [Section 66](#66-notification-service--spring-boot-4-mongodb-property-change) for the full explanation.
+
+---
+
+## 61. notification-service — MongoDB Data Model
+
+### Why MongoDB for notifications?
+
+Notifications are append-only event records. Every notification has the same top-level shape (username, type, message, timestamps) but could differ in payload (some carry orderId + paymentId, future types might carry different fields). MongoDB's flexible document model handles this naturally without requiring schema migrations.
+
+Crucially, there are no joins. Fetching all notifications for a user is a single collection scan filtered by `username` — no foreign key lookups needed.
+
+### PaymentEvent DTO
+```java
+public record PaymentEvent(
+        String eventType,    // "PAYMENT_SUCCESS" or "PAYMENT_FAILED"
+        Long paymentId,
+        Long orderId,
+        String username,
+        BigDecimal amount,
+        String failureReason // non-null only for PAYMENT_FAILED
+) {}
+```
+
+This is a Java record (immutable, auto-generated constructor/getters/equals/hashCode). It mirrors the record in payment-service exactly — same field names, same types. The JSON deserializer on the consumer side reconstructs it from the Kafka message bytes.
+
+> `failureReason` is `null` for `PAYMENT_SUCCESS` events. The service handles this gracefully in the message template.
+
+### Notification entity
+```java
+@Document(collection = "notifications")
+public class Notification {
+
+    @Id
+    private String id;           // MongoDB ObjectId — Spring Data stores as hex String
+
+    @Indexed
+    private String username;     // indexed for fast per-user queries
+
+    private String type;         // "ORDER_CONFIRMED" or "ORDER_CANCELLED"
+    private String message;      // human-readable text shown to the user
+    private Long orderId;
+    private Long paymentId;
+    private BigDecimal amount;
+    private boolean read;        // false until the user explicitly marks it read
+
+    @CreatedDate
+    private LocalDateTime createdAt;   // auto-populated by @EnableMongoAuditing
+
+    public Notification(String username, String type, String message,
+                        Long orderId, Long paymentId, BigDecimal amount) {
+        this.username  = username;
+        this.type      = type;
+        this.message   = message;
+        this.orderId   = orderId;
+        this.paymentId = paymentId;
+        this.amount    = amount;
+        this.read      = false;   // always starts unread
+    }
+    // getters + setRead()
+}
+```
+
+### Key annotation decisions
+
+**`@Document(collection = "notifications")`**
+Marks this as a MongoDB document. The `collection` name is the MongoDB collection (equivalent to a table in SQL). Without this, Spring Data MongoDB would derive the collection name from the class name (`notification`), which works but being explicit avoids surprises.
+
+**`@Id` on a `String` field**
+MongoDB uses `ObjectId` as its native ID type — a 12-byte BSON type that encodes timestamp + machine ID + counter. Spring Data MongoDB automatically converts `ObjectId` ↔ `String` when you declare `@Id` on a `String` field. You get hex strings like `"6a0c995b219c883cb6ca9f6e"` in JSON, which are URL-safe and easy to pass as path variables.
+
+**`@Indexed` on `username`**
+Every user-facing read query filters by `username`. Without an index, MongoDB does a full collection scan on every request. With the index, lookups are O(log n) regardless of how many total notifications exist. Spring Data MongoDB creates this index at startup when `@EnableMongoAuditing` is active.
+
+**`@CreatedDate`**
+Spring Data's auditing annotation. Automatically fills this field with `LocalDateTime.now()` when the document is first saved. Requires `@EnableMongoAuditing` on the application class — without it, the field is always `null`.
+
+**`read = false` in constructor**
+Every notification starts unread. The service only sets `read = true` explicitly when the user calls the mark-read endpoint. This means the unread count is always accurate without a separate status table.
+
+### MongoRepository
+```java
+public interface NotificationRepository extends MongoRepository<Notification, String> {
+
+    // All notifications for a user, newest first
+    List<Notification> findByUsernameOrderByCreatedAtDesc(String username);
+
+    // Only unread notifications, newest first
+    List<Notification> findByUsernameAndReadFalseOrderByCreatedAtDesc(String username);
+
+    // Count of unread — used for the badge endpoint
+    long countByUsernameAndReadFalse(String username);
+}
+```
+
+Spring Data MongoDB derives all three queries from the method names at startup — no implementation code needed. The rules:
+- `findBy<Field>` → filter on that field
+- `And<Field>` → add another filter condition
+- `<Field>False` → field must equal `false`
+- `OrderBy<Field>Desc` → sort descending by that field
+- `count` prefix → returns `long` instead of `List`
+
+The `String` type parameter in `MongoRepository<Notification, String>` is the ID type — matches the `String id` field annotated with `@Id`.
+
+### Sample MongoDB document
+```json
+{
+  "_id": ObjectId("6a0c995b219c883cb6ca9f6e"),
+  "username": "testuser",
+  "type": "ORDER_CONFIRMED",
+  "message": "Your order #6 has been confirmed! Payment of $9.99 was successful.",
+  "orderId": 6,
+  "paymentId": 4,
+  "amount": 9.99,
+  "read": false,
+  "createdAt": ISODate("2026-05-19T17:09:47.623Z"),
+  "_class": "com.fooddelivery.notificationservice.entity.Notification"
+}
+```
+
+> MongoDB automatically adds `_class` to store the fully-qualified class name. This supports polymorphic document hierarchies — for a flat collection like this, it's safe to ignore.
+
+---
+
+## 62. notification-service — Kafka Consumer
+
+### Consumer group separation
+The `payment-events` topic is consumed by two independent services:
+- `order-service` with group `order-service`
+- `notification-service` with group `notification-service`
+
+Each Kafka consumer group gets its own offset pointer into the topic partition. Publishing one message to `payment-events` results in both services receiving it independently — this is Kafka's fan-out. If you used the same group ID for both, only one of them would receive each message (Kafka load-balances within a group).
+
+### KafkaConsumerConfig
+```java
+@Configuration
+public class KafkaConsumerConfig {
+
+    @Value("${spring.kafka.bootstrap-servers}")
+    private String bootstrapServers;
+
+    @Bean
+    public ConsumerFactory<String, PaymentEvent> consumerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "notification-service");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+        props.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
+        props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, PaymentEvent.class.getName());
+        props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, false);
+        return new DefaultKafkaConsumerFactory<>(props);
+    }
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, PaymentEvent> kafkaListenerContainerFactory(
+            ConsumerFactory<String, PaymentEvent> consumerFactory) {
+        ConcurrentKafkaListenerContainerFactory<String, PaymentEvent> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory);
+        return factory;
+    }
+}
+```
+
+### Why the explicit `KafkaConsumerConfig` bean?
+In Spring Boot 3.x, `ConcurrentKafkaListenerContainerFactory` was auto-created by Spring Boot auto-configuration if a `spring-kafka` dependency was on the classpath. In **Spring Boot 4**, this auto-creation was removed. If you only add `@KafkaListener` without providing the `kafkaListenerContainerFactory` bean, Spring throws:
+
+```
+NoSuchBeanDefinitionException: No bean named 'kafkaListenerContainerFactory' available
+```
+
+The explicit `@Configuration` class declaring both beans (`ConsumerFactory` and `ConcurrentKafkaListenerContainerFactory`) is the fix.
+
+### Key consumer properties
+
+**`AUTO_OFFSET_RESET_CONFIG = "earliest"`**
+When this consumer group starts for the first time (no committed offset yet), start reading from the beginning of the topic. This ensures the service processes all historical events even if it was deployed after payment-service started publishing. The alternative `"latest"` would skip all prior events.
+
+**`USE_TYPE_INFO_HEADERS = false`**
+Instructs the `JsonDeserializer` to ignore the `__TypeId__` Kafka header when deserializing messages. This header contains the producer's fully-qualified class name (e.g. `com.fooddelivery.paymentservice.dto.PaymentEvent`). If the consumer tries to load that class, it throws `ClassNotFoundException` because the producer's package doesn't exist in the consumer's JVM. Setting this to `false` ignores the header entirely.
+
+**`VALUE_DEFAULT_TYPE = PaymentEvent.class.getName()`**
+Since we're ignoring `__TypeId__`, the deserializer needs to know what class to deserialize the JSON bytes into. This tells it to always use `PaymentEvent` regardless of headers.
+
+**`TRUSTED_PACKAGES = "*"`**
+Allows the deserializer to instantiate any class. Normally you'd restrict this to your own packages, but since we're using `VALUE_DEFAULT_TYPE` and `USE_TYPE_INFO_HEADERS = false`, the deserializer always targets `PaymentEvent` anyway — the trust list is irrelevant but still required to avoid a whitelist validation error.
+
+### PaymentEventListener
+```java
+@Component
+public class PaymentEventListener {
+
+    private static final Logger log = LoggerFactory.getLogger(PaymentEventListener.class);
+
+    private final NotificationService notificationService;
+
+    public PaymentEventListener(NotificationService notificationService) {
+        this.notificationService = notificationService;
+    }
+
+    @KafkaListener(topics = "payment-events", groupId = "notification-service")
+    public void onPaymentEvent(PaymentEvent event) {
+        log.info("Received payment event: {} for order {} user '{}'",
+                event.eventType(), event.orderId(), event.username());
+        notificationService.handlePaymentEvent(event);
+    }
+}
+```
+
+The `@KafkaListener` annotation on `onPaymentEvent` tells Spring Kafka to invoke this method for every message in `payment-events` for this consumer group. The `groupId` here should match the one in `KafkaConsumerConfig` — declaring it in both places is redundant but makes the intent explicit at the method level.
+
+The method delegates immediately to `notificationService.handlePaymentEvent()` rather than doing any logic itself. This keeps the listener thin — it's purely a Kafka-to-service bridge.
+
+---
+
+## 63. notification-service — Service Layer
+
+### handlePaymentEvent — event-to-notification translation
+```java
+public void handlePaymentEvent(PaymentEvent event) {
+    String type;
+    String message;
+
+    switch (event.eventType()) {
+        case "PAYMENT_SUCCESS" -> {
+            type    = "ORDER_CONFIRMED";
+            message = String.format(
+                "Your order #%d has been confirmed! Payment of $%s was successful.",
+                event.orderId(), event.amount());
+        }
+        case "PAYMENT_FAILED" -> {
+            type    = "ORDER_CANCELLED";
+            message = String.format(
+                "Payment failed for order #%d. Your order has been cancelled. Reason: %s",
+                event.orderId(),
+                event.failureReason() != null ? event.failureReason() : "Unknown error");
+        }
+        default -> {
+            log.warn("Unknown payment event type: {}", event.eventType());
+            return;   // discard unknown event types gracefully
+        }
+    }
+
+    Notification notification = new Notification(
+            event.username(), type, message,
+            event.orderId(), event.paymentId(), event.amount());
+
+    notificationRepository.save(notification);
+    log.info("Saved notification [{}] for user '{}' — order {}",
+             type, event.username(), event.orderId());
+}
+```
+
+**Event type mapping:**
+| Kafka `eventType` | MongoDB `type` | Message shown to user |
+|---|---|---|
+| `PAYMENT_SUCCESS` | `ORDER_CONFIRMED` | "Your order #6 has been confirmed! Payment of $9.99 was successful." |
+| `PAYMENT_FAILED` | `ORDER_CANCELLED` | "Payment failed for order #6. Your order has been cancelled. Reason: ..." |
+| anything else | — | logged as warning, discarded |
+
+The `default` branch with `return` is important: if payment-service ever adds a new event type (e.g. `PAYMENT_REFUNDED`), the notification-service won't crash — it just logs and moves on. The Kafka consumer commits the offset and continues processing subsequent messages.
+
+### Read/unread management
+```java
+public List<Notification> getUnread(String username) {
+    return notificationRepository.findByUsernameAndReadFalseOrderByCreatedAtDesc(username);
+}
+
+public List<Notification> getAll(String username) {
+    return notificationRepository.findByUsernameOrderByCreatedAtDesc(username);
+}
+
+public long countUnread(String username) {
+    return notificationRepository.countByUsernameAndReadFalse(username);
+}
+```
+
+All three methods take `username` from the authenticated `Principal` (set by the JWT filter), not from a request parameter. This means users can only ever query their own notifications — they cannot pass someone else's username.
+
+### markRead — ownership validation
+```java
+public void markRead(String username, String notificationId) {
+    Notification notification = notificationRepository.findById(notificationId)
+            .orElseThrow(() -> new IllegalArgumentException("Notification not found: " + notificationId));
+
+    if (!notification.getUsername().equals(username)) {
+        throw new IllegalArgumentException("Notification does not belong to this user");
+    }
+
+    notification.setRead(true);
+    notificationRepository.save(notification);
+}
+```
+
+The service fetches by ID first, then validates that `notification.getUsername()` matches the authenticated user's username. This prevents user A from marking user B's notifications as read by guessing MongoDB ObjectId strings.
+
+### markAllRead — bulk update
+```java
+public void markAllRead(String username) {
+    List<Notification> unread =
+            notificationRepository.findByUsernameAndReadFalseOrderByCreatedAtDesc(username);
+    unread.forEach(n -> n.setRead(true));
+    notificationRepository.saveAll(unread);
+}
+```
+
+This fetches all unread notifications for the user, sets `read = true` on each in memory, then calls `saveAll` to persist them all. `saveAll` issues one upsert per document — not a single bulk update. For users with hundreds of unread notifications this is inefficient, but for a typical notification feed it's acceptable and keeps the code simple. A production system would use `MongoTemplate` to issue a single `updateMany` query.
+
+---
+
+## 64. notification-service — Security Config
+
+### SecurityConfig
+```java
+@Configuration
+public class SecurityConfig {
+
+    private final JwtAuthFilter jwtAuthFilter;
+
+    public SecurityConfig(JwtAuthFilter jwtAuthFilter) {
+        this.jwtAuthFilter = jwtAuthFilter;
+    }
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(AbstractHttpConfigurer::disable)
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .exceptionHandling(e -> e
+                .authenticationEntryPoint((req, res, ex) -> {
+                    res.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                    res.setContentType("application/json");
+                    res.getWriter().write("{\"error\":\"Authorization header missing or invalid\"}");
+                })
+            )
+            .authorizeHttpRequests(auth -> auth
+                .anyRequest().authenticated()
+            )
+            .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+}
+```
+
+All endpoints require authentication — there are no public routes on this service. Unauthenticated requests get a JSON 401 response rather than the default HTML Spring Security error page.
+
+### JwtAuthFilter
+The filter reads the `Authorization: Bearer <token>` header, validates the JWT, and sets the `SecurityContext` with the username. This makes `Principal` available in controller method parameters.
+
+The filter is registered before `UsernamePasswordAuthenticationFilter` in the Spring Security chain — this is standard placement for custom JWT filters. It runs on every request before any authorization checks.
+
+Unlike cart-service or order-service, notification-service has no internal `ROLE_SERVICE` endpoints. All endpoints are user-facing, so the only role check is "is any valid JWT present?" — `anyRequest().authenticated()` covers this.
+
+---
+
+## 65. notification-service — Controller
+
+```java
+@RestController
+@RequestMapping("/notifications")
+public class NotificationController {
+
+    private final NotificationService notificationService;
+
+    public NotificationController(NotificationService notificationService) {
+        this.notificationService = notificationService;
+    }
+
+    @GetMapping
+    public ResponseEntity<List<Notification>> getUnread(Principal principal) {
+        return ResponseEntity.ok(notificationService.getUnread(principal.getName()));
+    }
+
+    @GetMapping("/all")
+    public ResponseEntity<List<Notification>> getAll(Principal principal) {
+        return ResponseEntity.ok(notificationService.getAll(principal.getName()));
+    }
+
+    @GetMapping("/count")
+    public ResponseEntity<Map<String, Long>> countUnread(Principal principal) {
+        long count = notificationService.countUnread(principal.getName());
+        return ResponseEntity.ok(Map.of("unread", count));
+    }
+
+    @PatchMapping("/{id}/read")
+    public ResponseEntity<Void> markRead(Principal principal, @PathVariable String id) {
+        notificationService.markRead(principal.getName(), id);
+        return ResponseEntity.noContent().build();
+    }
+
+    @PatchMapping("/read-all")
+    public ResponseEntity<Void> markAllRead(Principal principal) {
+        notificationService.markAllRead(principal.getName());
+        return ResponseEntity.noContent().build();
+    }
+}
+```
+
+### Endpoint table
+| Method | Path | Description | Response |
+|---|---|---|---|
+| `GET` | `/notifications` | Unread notifications only, newest first | `200 OK` — array |
+| `GET` | `/notifications/all` | All notifications (read + unread), newest first | `200 OK` — array |
+| `GET` | `/notifications/count` | Count of unread | `200 OK` — `{"unread": N}` |
+| `PATCH` | `/notifications/{id}/read` | Mark one notification as read | `204 No Content` |
+| `PATCH` | `/notifications/read-all` | Mark all notifications as read | `204 No Content` |
+
+### `Principal` injection
+Spring MVC injects the `Principal` interface automatically into controller methods. Its `.getName()` returns the username from the `Authentication` object set by `JwtAuthFilter`. This is cleaner than taking `@RequestHeader("X-Username")` because it relies on Spring Security's authentication chain rather than trusting an HTTP header value.
+
+### Why `PATCH` for read endpoints?
+`PATCH` is the semantically correct HTTP method for a partial update — we're updating only the `read` field, not replacing the entire notification resource. `PUT` would imply replacing the whole document. `POST` implies creating a new resource. `PATCH` is the idiomatic choice here.
+
+### Why `204 No Content` on mark-read?
+The client already has the notification data (it fetched it earlier). There's nothing meaningful to return after marking it read. `204 No Content` avoids sending an empty body, which would be `200 OK` with `null` or `{}` — both slightly misleading.
+
+---
+
+## 66. notification-service — Spring Boot 4 MongoDB Property Change
+
+This is the most important lesson from building notification-service. The MongoDB URI property changed between Spring Boot 3 and Spring Boot 4, and the old property is **silently ignored** — no error, no warning, just defaults.
+
+### The change
+| Spring Boot version | MongoDB URI property |
+|---|---|
+| 3.x | `spring.data.mongodb.uri` |
+| 4.x | `spring.mongodb.uri` |
+
+### What happens with the wrong property
+If you write `spring.data.mongodb.uri=mongodb://mongodb:27017/notificationdb` in Spring Boot 4, the auto-configuration class (`MongoProperties` with `@ConfigurationProperties(prefix = "spring.mongodb")`) never sees this property. It falls back to its default:
+
+```
+DEFAULT_URI = "mongodb://localhost/test"
+```
+
+The service starts successfully, connects to `localhost:27017`, and you only discover the problem at runtime when a MongoDB operation fails:
+
+```
+MongoSocketOpenException: Exception opening socket
+  caused by: java.net.ConnectException: Connection refused
+  address=localhost:27017, type=UNKNOWN, state=CONNECTING
+```
+
+This is especially confusing in Docker because the service starts, the Kafka consumer subscribes, events arrive — and then the first save attempt fails.
+
+### How to verify the property name
+The `@ConfigurationProperties` prefix is embedded in the compiled `MongoProperties.class` in the `spring-boot-mongodb-4.x.x.jar`. You can inspect it:
+
+```bash
+# Find the jar
+find ~/.m2 -name "spring-boot-mongodb-4*.jar"
+
+# Extract and inspect
+cd /tmp
+unzip -o <jar-path> 'org/springframework/boot/mongodb/autoconfigure/MongoProperties.class'
+javap -verbose org/springframework/boot/mongodb/autoconfigure/MongoProperties.class | grep "ConfigurationProperties" -A 3
+# Output: value="spring.mongodb"
+```
+
+In Spring Boot 4, MongoDB autoconfiguration moved from `spring-boot-autoconfigure` into a dedicated `spring-boot-mongodb` module — the package changed from `org.springframework.boot.autoconfigure.mongo` to `org.springframework.boot.mongodb.autoconfigure`.
+
+### The fix (three places)
+**`application.properties`:**
+```properties
+# Spring Boot 4 — NOT spring.data.mongodb.uri
+spring.mongodb.uri=mongodb://localhost:27017/notificationdb
+```
+
+**`application-docker.properties`:**
+```properties
+spring.mongodb.uri=mongodb://mongodb:27017/notificationdb
+```
+
+**`docker-compose.yml` environment variable:**
+```yaml
+# Environment variables follow Spring Boot relaxed binding:
+# spring.mongodb.uri → SPRING_MONGODB_URI (dots → underscores, uppercase)
+environment:
+  SPRING_MONGODB_URI: mongodb://mongodb:27017/notificationdb
+```
+
+> **Wrong:** `SPRING_DATA_MONGODB_URI` → ignored by Spring Boot 4
+> **Correct:** `SPRING_MONGODB_URI` → bound to `spring.mongodb.uri`
+
+### Other affected properties
+The same prefix rename affects all MongoDB connection properties:
+
+| Spring Boot 3.x | Spring Boot 4.x |
+|---|---|
+| `spring.data.mongodb.uri` | `spring.mongodb.uri` |
+| `spring.data.mongodb.host` | `spring.mongodb.host` |
+| `spring.data.mongodb.port` | `spring.mongodb.port` |
+| `spring.data.mongodb.database` | `spring.mongodb.database` |
+| `spring.data.mongodb.username` | `spring.mongodb.username` |
+| `spring.data.mongodb.password` | `spring.mongodb.password` |
+
+---
+
+## 67. notification-service — API Usage with curl
+
+### Prerequisites
+```bash
+# Login to get a JWT token
+TOKEN=$(curl -s -X POST http://localhost:8081/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"testuser","password":"password123"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+# Verify you have a token
+echo $TOKEN
+```
+
+### Trigger a notification (place an order)
+Notifications are created automatically by the Kafka consumer — you don't create them directly. To generate one, place an order:
+
+```bash
+# 1. Add something to cart
+curl -s -X POST http://localhost:8080/cart/items \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"productId":1,"quantity":2}'
+
+# 2. Place the order (triggers payment → Kafka → notification)
+curl -s -X POST http://localhost:8080/orders \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"shippingAddress":"123 Main St"}' | python3 -m json.tool
+# → {"id":6,"status":"PENDING","totalAmount":23.98,...}
+
+# 3. Wait ~3 seconds for the full async chain to complete
+# payment-service processes → publishes to Kafka → notification-service saves
+```
+
+### Get unread notifications
+```bash
+curl -s http://localhost:8080/notifications \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+# → [
+#     {
+#       "id": "6a0c995b219c883cb6ca9f6e",
+#       "username": "testuser",
+#       "type": "ORDER_CONFIRMED",
+#       "message": "Your order #6 has been confirmed! Payment of $23.98 was successful.",
+#       "orderId": 6,
+#       "paymentId": 4,
+#       "amount": 23.98,
+#       "read": false,
+#       "createdAt": "2026-05-19T17:09:47.623"
+#     }
+#   ]
+```
+
+### Get all notifications (read + unread)
+```bash
+curl -s http://localhost:8080/notifications/all \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+# → returns all notifications newest first, including ones already marked read
+```
+
+### Get unread count (for notification badge)
+```bash
+curl -s http://localhost:8080/notifications/count \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+# → {"unread": 1}
+```
+
+### Mark one notification as read
+```bash
+# Use the "id" from the GET /notifications response
+NOTIF_ID="6a0c995b219c883cb6ca9f6e"
+
+curl -s -X PATCH http://localhost:8080/notifications/${NOTIF_ID}/read \
+  -H "Authorization: Bearer $TOKEN"
+# → 204 No Content
+
+# Verify it's now read
+curl -s http://localhost:8080/notifications/count \
+  -H "Authorization: Bearer $TOKEN"
+# → {"unread": 0}
+```
+
+### Mark all notifications as read
+```bash
+curl -s -X PATCH http://localhost:8080/notifications/read-all \
+  -H "Authorization: Bearer $TOKEN"
+# → 204 No Content
+```
+
+### Verify data directly in MongoDB
+```bash
+# Connect to MongoDB container
+docker exec -it ecommerce-mongodb mongosh notificationdb
+
+# Inside mongosh:
+db.notifications.find().pretty()
+# Shows all documents in the collection
+
+db.notifications.find({username: "testuser"}).pretty()
+# Filter by user
+
+db.notifications.countDocuments({read: false})
+# Count unread across all users
+
+db.notifications.getIndexes()
+# Should show index on 'username' field
+```
+
+### Test directly against notification-service (bypassing gateway)
+```bash
+# Useful when debugging gateway routing issues
+curl -s http://localhost:8087/notifications \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+---
+
+## 68. Common Errors and Fixes (notification-service/MongoDB)
+
+---
+
+### MongoDB connects to localhost instead of the Docker container host
+
+**Symptom:**
+```
+MongoSocketOpenException: Exception opening socket
+  caused by: java.net.ConnectException: Connection refused
+  ...servers=[{address=localhost:27017, type=UNKNOWN, state=CONNECTING...
+```
+
+The service starts successfully, the Kafka consumer subscribes, and events arrive — but every MongoDB save fails.
+
+**Cause:** The MongoDB URI property changed in Spring Boot 4. `spring.data.mongodb.uri` is silently ignored. The auto-configuration falls back to `mongodb://localhost/test`.
+
+**Fix:** Use `spring.mongodb.uri` everywhere:
+```properties
+# application.properties
+spring.mongodb.uri=mongodb://localhost:27017/notificationdb
+
+# application-docker.properties
+spring.mongodb.uri=mongodb://mongodb:27017/notificationdb
+```
+
+And in docker-compose:
+```yaml
+environment:
+  SPRING_MONGODB_URI: mongodb://mongodb:27017/notificationdb
+  # NOT: SPRING_DATA_MONGODB_URI (ignored in Spring Boot 4)
+```
+
+See [Section 66](#66-notification-service--spring-boot-4-mongodb-property-change) for the full explanation and property rename table.
+
+---
+
+### `@CreatedDate` field is always null in MongoDB documents
+
+**Symptom:** Notifications save successfully but `createdAt` is `null` in every document.
+
+**Cause:** `@EnableMongoAuditing` is missing from the application class. Without it, Spring Data MongoDB doesn't process `@CreatedDate` / `@LastModifiedDate` annotations.
+
+**Fix:** Add `@EnableMongoAuditing` to `NotificationServiceApplication`:
+```java
+@SpringBootApplication
+@EnableKafka
+@EnableMongoAuditing   // ← this line
+public class NotificationServiceApplication { ... }
+```
+
+---
+
+### Kafka consumer not receiving events (`@KafkaListener` silently ignored)
+
+**Symptom:** The service starts with no errors, but `PaymentEventListener.onPaymentEvent` is never called even though payment-service published events.
+
+**Cause:** `@EnableKafka` is missing from the application class. In Spring Boot 4, `@KafkaListener` is not activated automatically. Without `@EnableKafka`, listener methods are discovered but never wired to a consumer.
+
+**Fix:**
+```java
+@SpringBootApplication
+@EnableKafka           // ← this line
+@EnableMongoAuditing
+public class NotificationServiceApplication { ... }
+```
+
+---
+
+### `NoSuchBeanDefinitionException: No bean named 'kafkaListenerContainerFactory'`
+
+**Symptom:** Service fails to start with:
+```
+NoSuchBeanDefinitionException: No bean named 'kafkaListenerContainerFactory' available
+```
+
+**Cause:** In Spring Boot 4, `ConcurrentKafkaListenerContainerFactory` is no longer auto-created. The `@KafkaListener` infrastructure requires this bean by name.
+
+**Fix:** Add an explicit `KafkaConsumerConfig` class that declares both the `ConsumerFactory` and `kafkaListenerContainerFactory` beans. The bean name `kafkaListenerContainerFactory` must match exactly — Spring Kafka looks it up by name.
+
+```java
+@Configuration
+public class KafkaConsumerConfig {
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, PaymentEvent> kafkaListenerContainerFactory(
+            ConsumerFactory<String, PaymentEvent> consumerFactory) {
+        var factory = new ConcurrentKafkaListenerContainerFactory<String, PaymentEvent>();
+        factory.setConsumerFactory(consumerFactory);
+        return factory;
+    }
+}
+```
+
+---
+
+### `ClassNotFoundException` during Kafka deserialization
+
+**Symptom:**
+```
+ClassNotFoundException: com.fooddelivery.paymentservice.dto.PaymentEvent
+```
+Consumer crashes on every message; no notifications are saved.
+
+**Cause:** The `JsonSerializer` on payment-service embeds `__TypeId__: com.fooddelivery.paymentservice.dto.PaymentEvent` into each Kafka message header. The consumer tries to load that class but it doesn't exist in the notification-service JVM.
+
+**Fix (consumer side):**
+```java
+props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, false);
+props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, PaymentEvent.class.getName());
+```
+
+**Fix (producer side, in payment-service):**
+```java
+props.put(JsonSerializer.ADD_TYPE_INFO_HEADERS, false);
+```
+
+After fixing, delete any messages with bad headers by deleting and recreating the topic:
+```bash
+docker exec ecommerce-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:9092 --delete --topic payment-events
+```
+
+---
+
+### GET /notifications returns 404 via the gateway
+
+**Symptom:** Requests to `http://localhost:8080/notifications` return `404 Not Found`. Direct calls to `http://localhost:8087/notifications` work.
+
+**Cause:** The api-gateway Docker image was built before the `/notifications` route was added to `application-docker.yml`. The running container has the old route table without the notification-service entry.
+
+**Fix:** Rebuild and restart the api-gateway:
+```bash
+docker compose build api-gateway
+docker compose up -d api-gateway
+```
+
+**Prevention:** After changing gateway configuration, always rebuild the gateway image. The route table is baked into the jar at build time.

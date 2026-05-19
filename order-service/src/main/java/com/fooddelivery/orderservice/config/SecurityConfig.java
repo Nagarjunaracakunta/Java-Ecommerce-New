@@ -1,4 +1,4 @@
-package com.fooddelivery.cartservice.config;
+package com.fooddelivery.orderservice.config;
 
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.context.annotation.Bean;

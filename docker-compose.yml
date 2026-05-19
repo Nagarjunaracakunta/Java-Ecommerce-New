@@ -20,6 +20,26 @@ services:
     networks:
       - ecommerce-network
 
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: ecommerce-postgres
+    environment:
+      POSTGRES_DB: orderdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orderdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ecommerce-network
+
   # ── Redis ─────────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
@@ -106,6 +126,26 @@ services:
     networks:
       - ecommerce-network
 
+  # ── order-service ────────────────────────────────────────────────────────────
+  order-service:
+    build:
+      context: .
+      dockerfile: order-service/Dockerfile
+    container_name: ecommerce-orders
+    ports:
+      - "8084:8084"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      JWT_SECRET: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+    depends_on:
+      postgres:
+        condition: service_healthy
+      cart-service:
+        condition: service_started
+    restart: on-failure
+    networks:
+      - ecommerce-network
+
   # ── SonarQube ─────────────────────────────────────────────────────────────────
   sonarqube:
     image: sonarqube:lts-community
@@ -140,6 +180,7 @@ networks:
     driver: bridge
 
 volumes:
+  postgres-data:
   redis-data:
   mysql-data:
   sonarqube_data:

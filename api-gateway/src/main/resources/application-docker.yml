@@ -5,3 +5,4 @@ gateway:
     "[/auth]": http://auth-service:8081
     "[/products]": http://product-service:8082
     "[/cart]": http://cart-service:8083
+    "[/orders]": http://order-service:8084

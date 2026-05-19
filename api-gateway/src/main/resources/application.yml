@@ -12,6 +12,7 @@ gateway:
     "[/auth]": http://localhost:8081
     "[/products]": http://localhost:8082
     "[/cart]": http://localhost:8083
+    "[/orders]": http://localhost:8084
 
 # Shared JWT secret — same value across auth-service, product-service, api-gateway
 jwt:

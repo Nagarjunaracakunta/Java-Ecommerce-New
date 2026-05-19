@@ -10,14 +10,14 @@ COPY cart-service/pom.xml    cart-service/
 COPY order-service/pom.xml   order-service/
 
 RUN mvn install -N -q
-RUN mvn dependency:go-offline -pl product-service -q
+RUN mvn dependency:go-offline -pl order-service -q
 
-COPY product-service/src product-service/src
-RUN mvn package -pl product-service -DskipTests -q
+COPY order-service/src order-service/src
+RUN mvn package -pl order-service -DskipTests -q
 
 # Stage 2 — Runtime
 FROM eclipse-temurin:21-jre-jammy
 WORKDIR /app
-COPY --from=builder /workspace/product-service/target/*.jar app.jar
-EXPOSE 8082
+COPY --from=builder /workspace/order-service/target/*.jar app.jar
+EXPOSE 8084
 ENTRYPOINT ["java", "-jar", "app.jar"]

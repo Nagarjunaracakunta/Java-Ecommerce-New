@@ -1,5 +1,5 @@
 # Java Ecommerce — Services Guide
-# api-gateway · auth-service · product-service · JWT · Spring Security · Validations · Design Patterns
+# api-gateway · auth-service · product-service · cart-service · order-service · payment-service · JWT · Kafka · Redis
 
 ---
 
@@ -46,8 +46,39 @@
 32. [Creating the First Admin User](#32-creating-the-first-admin-user)
 33. [auth-service — API Usage with curl](#33-auth-service--api-usage-with-curl)
 
+**cart-service**
+35. [cart-service — Overview and Structure](#35-cart-service--overview-and-structure)
+36. [cart-service — Redis Data Model](#36-cart-service--redis-data-model)
+37. [cart-service — Service-to-Service Authentication](#37-cart-service--service-to-service-authentication)
+38. [cart-service — Security Config](#38-cart-service--security-config)
+39. [cart-service — Service Layer](#39-cart-service--service-layer)
+40. [cart-service — Controller (Public and Internal Endpoints)](#40-cart-service--controller-public-and-internal-endpoints)
+41. [cart-service — API Usage with curl](#41-cart-service--api-usage-with-curl)
+
+**order-service**
+42. [order-service — Overview and Structure](#42-order-service--overview-and-structure)
+43. [order-service — Entity Design: Order, OrderItem, OrderStatus](#43-order-service--entity-design-order-orderitem-orderstatus)
+44. [order-service — Price Snapshot Pattern](#44-order-service--price-snapshot-pattern)
+45. [order-service — JPA Auditing (@CreatedDate / @LastModifiedDate)](#45-order-service--jpa-auditing-createddate--lastmodifieddate)
+46. [order-service — Service-to-Service Clients](#46-order-service--service-to-service-clients)
+47. [order-service — Service Layer: Order Creation Flow](#47-order-service--service-layer-order-creation-flow)
+48. [order-service — Kafka Consumer](#48-order-service--kafka-consumer)
+49. [order-service — Controller](#49-order-service--controller)
+50. [order-service — API Usage with curl](#50-order-service--api-usage-with-curl)
+
+**payment-service**
+51. [payment-service — Overview and Structure](#51-payment-service--overview-and-structure)
+52. [payment-service — Entity Design: Payment and PaymentStatus](#52-payment-service--entity-design-payment-and-paymentstatus)
+53. [payment-service — Kafka Producer](#53-payment-service--kafka-producer)
+54. [payment-service — Service Layer: Payment Flow](#54-payment-service--service-layer-payment-flow)
+55. [payment-service — Security: ROLE_SERVICE Guard](#55-payment-service--security-role_service-guard)
+56. [payment-service — Controller](#56-payment-service--controller)
+57. [payment-service — Complete Async Flow End-to-End](#57-payment-service--complete-async-flow-end-to-end)
+58. [payment-service — API Usage with curl](#58-payment-service--api-usage-with-curl)
+
 **Errors**
-34. [Common Errors and Fixes](#34-common-errors-and-fixes)
+34. [Common Errors and Fixes (auth/product/gateway)](#34-common-errors-and-fixes)
+59. [Common Errors and Fixes (cart/order/payment/Kafka)](#59-common-errors-and-fixes-cartorderpaymentkafka)
 
 ---
 
@@ -2358,4 +2389,1620 @@ Could not resolve placeholder 'jwt.secret'
 ```properties
 jwt.secret=5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
 jwt.expiration-ms=86400000
+```
+
+---
+
+## 35. cart-service — Overview and Structure
+
+Runs on port 8083. Manages each user's shopping cart using **Redis** as the storage backend. Cart data is ephemeral by design — it disappears when the cart is cleared or when the user places an order. Redis is a perfect fit because carts don't need SQL relations, they need fast reads/writes and optional TTL expiry.
+
+```
+cart-service/
+├── config/
+│   ├── AppConfig.java              — RestClient bean (used to call product-service)
+│   ├── JwtAuthFilter.java          — JWT filter (same pattern as other services)
+│   └── SecurityConfig.java         — all endpoints require auth; @EnableMethodSecurity
+├── controller/
+│   └── CartController.java         — public cart endpoints + internal service endpoints
+├── dto/
+│   ├── CartItemRequest.java        — record: productId + quantity (validated)
+│   ├── CartItemResponse.java       — record: productId, name, price, quantity, subtotal
+│   ├── CartResponse.java           — record: username, items[], total
+│   └── ProductResponse.java        — record: snapshot of product data from product-service
+├── exception/
+│   ├── GlobalExceptionHandler.java — maps exceptions to HTTP responses
+│   └── ProductNotFoundException.java
+├── service/
+│   └── CartService.java            — all cart operations with Redis
+└── util/
+    ├── JwtUtil.java                — JWT verify / extract
+    └── ServiceTokenProvider.java   — generates short-lived ROLE_SERVICE tokens
+```
+
+### Port allocation
+| Service | Port | Database | Purpose |
+|---|---|---|---|
+| cart-service | 8083 | Redis 6379 | Per-user cart storage |
+
+### application.properties
+```properties
+spring.application.name=cart-service
+server.port=8083
+spring.data.redis.host=localhost
+spring.data.redis.port=6379
+jwt.secret=5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+product.service.url=http://localhost:8082
+```
+
+In Docker mode (`application-docker.properties`):
+```properties
+spring.data.redis.host=redis
+product.service.url=http://product-service:8082
+```
+
+### Dependencies
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-api</artifactId>
+    <version>0.12.6</version>
+</dependency>
+```
+
+---
+
+## 36. cart-service — Redis Data Model
+
+### Key structure
+```
+cart:{username}   →  Redis Hash
+    field: "{productId}"    value: "{quantity}"
+    field: "{productId}"    value: "{quantity}"
+    ...
+```
+
+**Example — cart for user "alice":**
+```
+HSET cart:alice 1 2    ← productId=1, quantity=2
+HSET cart:alice 3 1    ← productId=3, quantity=1
+```
+
+### Why a Hash, not a String or List?
+
+| Structure | Problem |
+|---|---|
+| String (JSON blob) | Read-modify-write the entire JSON to change one item — not atomic |
+| List | No natural key for productId — would need to scan the whole list |
+| Hash | Each productId is a field — `HSET`, `HGET`, `HDEL` are all O(1) |
+
+A Redis Hash lets you add, update, or remove individual items without touching the rest of the cart. `HGET cart:alice 1` returns just the quantity for product 1 — no full scan.
+
+### Why quantities are stored as Strings in Redis
+Redis hashes store byte arrays. Spring's `StringRedisTemplate` works with `String` keys and values. The quantities are stored as string digits (`"2"`, `"1"`) and parsed back to `int` in Java. This avoids needing a custom serializer.
+
+### Why product data is NOT stored in Redis
+The cart only stores `productId → quantity`. Product names and prices are fetched fresh from product-service every time you call `GET /cart`. This ensures:
+- Cart always reflects the current product name (even after a rename)
+- No stale price shown to user at browse time
+- BUT: the price at checkout (order creation) is snapshotted — see [Order Service Price Snapshot Pattern](#44-order-service--price-snapshot-pattern)
+
+---
+
+## 37. cart-service — Service-to-Service Authentication
+
+### The problem
+cart-service calls product-service to validate that a product exists before adding it to the cart. product-service's write endpoints require `ROLE_ADMIN`. The `GET /products/{id}` endpoint is public — but we still want to send an authenticated request so the gateway can identify the caller.
+
+More importantly, order-service calls cart-service's **internal** endpoints (`/cart/internal/{username}`). These internal endpoints must be accessible to order-service but not to regular users. The solution: a machine identity JWT with `ROLE_SERVICE`.
+
+### ServiceTokenProvider
+```java
+@Component
+public class ServiceTokenProvider {
+
+    private static final long TTL_MS = 60_000; // 1 minute
+
+    @Value("${jwt.secret}")
+    private String secret;
+
+    public String token() {
+        return Jwts.builder()
+                .subject("cart-service")          // identifies the caller service
+                .claim("role", "ROLE_SERVICE")    // machine role — not ROLE_USER or ROLE_ADMIN
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + TTL_MS))
+                .signWith(signingKey())
+                .compact();
+    }
+}
+```
+
+**Key design decisions:**
+- TTL is 60 seconds — tokens are short-lived and generated on-demand. If compromised, they expire quickly.
+- `sub: "cart-service"` identifies which service made the call (useful in logs).
+- `ROLE_SERVICE` is a separate machine role — it cannot be obtained by any user registration flow.
+- The token is signed with the **same shared secret** as all other JWTs — no separate PKI or secret management needed.
+
+### How it flows
+```
+cart-service needs to call product-service:
+  1. ServiceTokenProvider.token() → generates a 60s JWT with ROLE_SERVICE
+  2. RestClient.get()
+       .uri(productServiceUrl + "/products/" + productId)
+       .header("Authorization", "Bearer " + token)
+       .retrieve()
+
+product-service JwtAuthFilter validates the token:
+  3. isTokenValid(token) → true (same secret)
+  4. extractRole(token) → "ROLE_SERVICE"
+  5. Sets SecurityContext with ROLE_SERVICE authority
+  6. GET /products/{id} is public → request passes
+```
+
+### Why not use the user's JWT for service-to-service calls
+If cart-service forwarded the user's JWT to product-service, product-service would see the request as coming from the user. For internal endpoints protected by `@PreAuthorize("hasRole('SERVICE')")`, the user's token (which has `ROLE_USER`) would be rejected. Using a machine token with `ROLE_SERVICE` keeps service identity distinct from user identity.
+
+---
+
+## 38. cart-service — Security Config
+
+All cart endpoints require authentication. The internal endpoints additionally require `ROLE_SERVICE` via `@PreAuthorize`.
+
+```java
+@Configuration
+@EnableMethodSecurity   // ← activates @PreAuthorize on controller methods
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(AbstractHttpConfigurer::disable)
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .exceptionHandling(e -> e
+                .authenticationEntryPoint((req, res, ex) -> {
+                    res.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                    res.setContentType("application/json");
+                    res.getWriter().write("{\"error\":\"Authorization header missing or invalid\"}");
+                })
+            )
+            .authorizeHttpRequests(auth -> auth
+                .anyRequest().authenticated()   // every endpoint needs a valid JWT
+            )
+            .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+}
+```
+
+### Why a custom AuthenticationEntryPoint
+Without it, Spring Security returns `403 Forbidden` for unauthenticated requests (default behavior). The correct HTTP code for "no credentials provided" is `401 Unauthorized`. The custom entry point:
+1. Returns `401` instead of `403`
+2. Returns a JSON body instead of an HTML error page
+
+### Why `@EnableMethodSecurity` is required
+`@PreAuthorize("hasRole('SERVICE')")` on the internal endpoints is silently ignored without this annotation. Any authenticated user could call the internal endpoints, defeating their purpose. With `@EnableMethodSecurity`, Spring evaluates the `@PreAuthorize` expression after authentication succeeds — users with `ROLE_USER` are rejected at the method level.
+
+---
+
+## 39. cart-service — Service Layer
+
+```java
+@Service
+public class CartService {
+
+    private static final String CART_KEY_PREFIX = "cart:";
+
+    // ADD: validate product exists, then increment quantity in Redis hash
+    public void addItem(String username, CartItemRequest request) {
+        fetchProduct(request.productId());   // throws ProductNotFoundException if not found
+
+        String key = cartKey(username);
+        String field = String.valueOf(request.productId());
+        String existing = (String) redis.opsForHash().get(key, field);
+        int newQty = (existing != null ? Integer.parseInt(existing) : 0) + request.quantity();
+        redis.opsForHash().put(key, field, String.valueOf(newQty));
+    }
+
+    // GET: read all hash fields, fetch live product data for each, compute totals
+    public CartResponse getCart(String username) {
+        Map<Object, Object> entries = redis.opsForHash().entries(cartKey(username));
+        List<CartItemResponse> items = new ArrayList<>();
+        for (Map.Entry<Object, Object> entry : entries.entrySet()) {
+            Long productId = Long.parseLong((String) entry.getKey());
+            int quantity   = Integer.parseInt((String) entry.getValue());
+            ProductResponse product = fetchProduct(productId);
+            BigDecimal subtotal = product.price().multiply(BigDecimal.valueOf(quantity));
+            items.add(new CartItemResponse(productId, product.name(), product.price(), quantity, subtotal));
+        }
+        BigDecimal total = items.stream().map(CartItemResponse::subtotal)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        return new CartResponse(username, items, total);
+    }
+
+    // REMOVE: delete one hash field; fail-fast if product wasn't in cart
+    public void removeItem(String username, Long productId) {
+        long removed = redis.opsForHash().delete(cartKey(username), String.valueOf(productId));
+        if (removed == 0) {
+            throw new ProductNotFoundException("Product " + productId + " is not in the cart");
+        }
+    }
+
+    // CLEAR: delete the entire hash (used by order-service after order placement)
+    public void clearCart(String username) {
+        redis.delete(cartKey(username));
+    }
+
+    // Calls product-service with a service JWT to validate product exists
+    private ProductResponse fetchProduct(Long productId) {
+        return restClient.get()
+                .uri(productServiceUrl + "/products/" + productId)
+                .header("Authorization", "Bearer " + serviceTokenProvider.token())
+                .retrieve()
+                .onStatus(HttpStatusCode::is4xxClientError, (req, res) -> {
+                    throw new ProductNotFoundException("Product not found: " + productId);
+                })
+                .body(ProductResponse.class);
+    }
+
+    private String cartKey(String username) {
+        return CART_KEY_PREFIX + username;
+    }
+}
+```
+
+### Design decisions
+
+**Why validate product on addItem, not just on getCart?**
+If we skip validation on add, users can add non-existent product IDs. When they view the cart later, `fetchProduct` would throw an exception for every invalid ID — the cart becomes unreadable until the bad items are removed. Validating on add prevents the cart from ever containing phantom products.
+
+**Why fetch live product data on every getCart?**
+Cart items only store `productId → quantity`. Prices and names come from product-service at read time. This ensures the displayed price is always current. The tradeoff is N product-service calls per cart view (one per item). For a cart with 3-5 items this is acceptable. Caching with a short TTL could be added if needed.
+
+**Why `redis.opsForHash()` vs `redis.opsForValue()`?**
+`opsForValue()` stores one key → one string value. Updating a single cart item would require reading the whole JSON, modifying it, writing it back — a read-modify-write that is not atomic. `opsForHash()` lets you update a single field atomically with `HSET` without touching other fields.
+
+---
+
+## 40. cart-service — Controller (Public and Internal Endpoints)
+
+```java
+@RestController
+@RequestMapping("/cart")
+public class CartController {
+
+    // ── User-facing endpoints ──────────────────────────────────────────────────
+    // These are routed via api-gateway. The username comes from Principal
+    // (set by JwtAuthFilter from the JWT sub claim).
+
+    @GetMapping
+    public ResponseEntity<CartResponse> getCart(Principal principal) {
+        return ResponseEntity.ok(cartService.getCart(principal.getName()));
+    }
+
+    @PostMapping("/items")
+    public ResponseEntity<Void> addItem(Principal principal,
+                                        @Valid @RequestBody CartItemRequest request) {
+        cartService.addItem(principal.getName(), request);
+        return ResponseEntity.status(HttpStatus.CREATED).build();
+    }
+
+    @DeleteMapping("/items/{productId}")
+    public ResponseEntity<Void> removeItem(Principal principal, @PathVariable Long productId) {
+        cartService.removeItem(principal.getName(), productId);
+        return ResponseEntity.noContent().build();
+    }
+
+    @DeleteMapping
+    public ResponseEntity<Void> clearCart(Principal principal) {
+        cartService.clearCart(principal.getName());
+        return ResponseEntity.noContent().build();
+    }
+
+    // ── Internal endpoints — NOT routed via api-gateway ───────────────────────
+    // Accessible only within the Docker network. Protected by @PreAuthorize("hasRole('SERVICE')")
+    // so only services presenting a ROLE_SERVICE token (from ServiceTokenProvider) can call them.
+
+    @PreAuthorize("hasRole('SERVICE')")
+    @GetMapping("/internal/{username}")
+    public ResponseEntity<CartResponse> getCartInternal(@PathVariable String username) {
+        return ResponseEntity.ok(cartService.getCart(username));
+    }
+
+    @PreAuthorize("hasRole('SERVICE')")
+    @DeleteMapping("/internal/{username}")
+    public ResponseEntity<Void> clearCartInternal(@PathVariable String username) {
+        cartService.clearCart(username);
+        return ResponseEntity.noContent().build();
+    }
+}
+```
+
+### Why internal endpoints use `{username}` path variable, not `Principal`
+
+For user-facing endpoints, `Principal.getName()` reads the `sub` claim from the user's JWT — which is the username. This is correct because the user can only access their own cart.
+
+For internal endpoints called by order-service, `Principal.getName()` would return `"order-service"` (the `sub` of the service token) — not the actual customer username. Order-service passes the customer's username in the URL path:
+
+```
+GET /cart/internal/alice
+Authorization: Bearer <service-token with sub=order-service, role=ROLE_SERVICE>
+```
+
+This way cart-service looks up `cart:alice` in Redis, not `cart:order-service`.
+
+### Endpoint summary
+
+| Endpoint | Auth | Role | Description |
+|---|---|---|---|
+| `GET /cart` | Required | Any user | Get caller's cart |
+| `POST /cart/items` | Required | Any user | Add item to caller's cart |
+| `DELETE /cart/items/{productId}` | Required | Any user | Remove one item |
+| `DELETE /cart` | Required | Any user | Clear caller's cart |
+| `GET /cart/internal/{username}` | Required | ROLE_SERVICE | Get any user's cart (for order-service) |
+| `DELETE /cart/internal/{username}` | Required | ROLE_SERVICE | Clear any user's cart (after order) |
+
+---
+
+## 41. cart-service — API Usage with curl
+
+```bash
+# --- Get a user JWT first ---
+TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"password123"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+# Add item (product 1, qty 2)
+curl -X POST http://localhost:8080/cart/items \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"productId":1,"quantity":2}'
+# → 201 Created (no body)
+
+# Add another item
+curl -X POST http://localhost:8080/cart/items \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"productId":3,"quantity":1}'
+
+# View cart (fetches live prices from product-service)
+curl http://localhost:8080/cart \
+  -H "Authorization: Bearer $TOKEN"
+# → {"username":"alice","items":[{"productId":1,"productName":"Classic Burger","price":11.99,"quantity":2,"subtotal":23.98},...],"total":28.97}
+
+# Remove one item
+curl -X DELETE http://localhost:8080/cart/items/1 \
+  -H "Authorization: Bearer $TOKEN"
+# → 204 No Content
+
+# Clear the whole cart
+curl -X DELETE http://localhost:8080/cart \
+  -H "Authorization: Bearer $TOKEN"
+# → 204 No Content
+
+# Add non-existent product → 404
+curl -X POST http://localhost:8080/cart/items \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"productId":9999,"quantity":1}'
+# → {"error":"Product not found: 9999"}
+
+# No token → 401
+curl http://localhost:8080/cart
+# → {"error":"Authorization header missing or invalid"}
+```
+
+---
+
+## 42. order-service — Overview and Structure
+
+Runs on port 8084. Handles order creation, retrieval, and cancellation. Stores orders in **PostgreSQL**. Talks to cart-service (to read and clear the cart) and payment-service (to initiate payment) via internal HTTP calls. Listens to Kafka topic `payment-events` to update order status asynchronously.
+
+```
+order-service/
+├── client/
+│   ├── CartClient.java          — calls cart-service /cart/internal/{username}
+│   └── PaymentClient.java       — calls payment-service /payments (non-fatal on failure)
+├── config/
+│   ├── AppConfig.java           — RestClient bean
+│   ├── JwtAuthFilter.java       — JWT filter
+│   ├── KafkaConsumerConfig.java — ConsumerFactory + ConcurrentKafkaListenerContainerFactory
+│   └── SecurityConfig.java      — all endpoints require auth
+├── controller/
+│   └── OrderController.java     — POST/GET/DELETE /orders
+├── dto/
+│   ├── CartItemResponse.java    — mirrors cart-service's response shape
+│   ├── CartResponse.java
+│   ├── CreateOrderRequest.java  — record: shippingAddress
+│   ├── InitiatePaymentRequest.java — record: orderId, amount, username
+│   ├── OrderItemResponse.java   — record: product snapshot fields
+│   ├── OrderResponse.java       — record: full order with items and timestamps
+│   └── PaymentEvent.java        — record: matches payment-service Kafka message
+├── entity/
+│   ├── Order.java               — JPA entity with @EnableJpaAuditing
+│   ├── OrderItem.java           — child entity with price snapshot
+│   └── OrderStatus.java         — PENDING, CONFIRMED, SHIPPED, DELIVERED, CANCELLED
+├── exception/
+│   ├── GlobalExceptionHandler.java
+│   └── OrderNotFoundException.java
+├── kafka/
+│   └── PaymentEventConsumer.java  — @KafkaListener on "payment-events"
+├── repository/
+│   └── OrderRepository.java
+├── service/
+│   └── OrderService.java
+└── util/
+    ├── JwtUtil.java
+    └── ServiceTokenProvider.java  — generates ROLE_SERVICE tokens for outbound calls
+```
+
+### Database
+Uses PostgreSQL (`orderdb`). Separate from MySQL (auth/product) because:
+- PostgreSQL has better support for JSON, complex queries, and analytics — useful for order history
+- Separating databases means an auth-service outage doesn't affect order lookup
+- Different teams could own different databases independently
+
+---
+
+## 43. order-service — Entity Design: Order, OrderItem, OrderStatus
+
+### OrderStatus enum
+```java
+public enum OrderStatus {
+    PENDING,    // just created — payment not yet confirmed
+    CONFIRMED,  // payment succeeded (set by Kafka consumer)
+    SHIPPED,    // future — set by shipping system
+    DELIVERED,  // future — set on delivery confirmation
+    CANCELLED   // payment failed or user cancelled
+}
+```
+
+### Order entity
+```java
+@Entity
+@Table(name = "orders")
+@EntityListeners(AuditingEntityListener.class)
+public class Order {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false)
+    private String username;          // the customer who placed the order
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private OrderStatus status;       // starts PENDING, Kafka consumer changes it
+
+    @Column(nullable = false, precision = 10, scale = 2)
+    private BigDecimal totalAmount;   // total at time of order (snapshot)
+
+    @Column(nullable = false)
+    private String shippingAddress;
+
+    @OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<OrderItem> items = new ArrayList<>();
+
+    @CreatedDate @Column(updatable = false)
+    private LocalDateTime createdAt;
+
+    @LastModifiedDate
+    private LocalDateTime updatedAt;
+}
+```
+
+### OrderItem entity
+```java
+@Entity
+@Table(name = "order_items")
+public class OrderItem {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "order_id", nullable = false)
+    private Order order;
+
+    @Column(nullable = false)
+    private Long productId;
+
+    @Column(nullable = false)
+    private String productName;  // snapshot — see Price Snapshot Pattern
+
+    @Column(nullable = false, precision = 10, scale = 2)
+    private BigDecimal price;    // snapshot
+
+    @Column(nullable = false)
+    private int quantity;
+
+    @Column(nullable = false, precision = 10, scale = 2)
+    private BigDecimal subtotal; // price × quantity, computed at order time
+}
+```
+
+### Relationship: Order ↔ OrderItem
+```
+Order (1) ←─── (Many) OrderItem
+  cascade = ALL        → saving an Order also saves all its OrderItems
+  orphanRemoval = true → removing an item from order.getItems() deletes it from DB
+  FetchType.LAZY       → items not loaded unless explicitly accessed
+```
+
+`CascadeType.ALL` means you only call `orderRepository.save(order)` — JPA automatically persists all the `OrderItem` objects in `order.getItems()`. You don't need a separate `orderItemRepository.save()`.
+
+---
+
+## 44. order-service — Price Snapshot Pattern
+
+### The problem
+A customer places an order for a Burger at $9.99. A week later, the admin raises the price to $12.99. When the customer looks at their old order, should it show $9.99 or $12.99?
+
+**Answer:** It must show $9.99 — the price they agreed to pay.
+
+### The solution — snapshot at order creation time
+When an order is created, `OrderItem` copies `productName` and `price` from the cart (which got them from product-service) at that exact moment:
+
+```java
+cart.items().forEach(item -> {
+    OrderItem orderItem = new OrderItem(
+            order,
+            item.productId(),
+            item.productName(),   // ← copied from cart at this moment
+            item.price(),         // ← copied from cart at this moment
+            item.quantity(),
+            item.subtotal()
+    );
+    order.getItems().add(orderItem);
+});
+```
+
+After this point, product-service can change the price of Burger to any value — the `order_items` table permanently holds `price = 9.99` for that order.
+
+### Why not store only productId and look up the price later?
+If you stored only `productId` and joined with products on every order lookup, the displayed price would change whenever the product price changes. Historical orders would be wrong — this is a data integrity issue.
+
+### Trade-off
+The snapshot means the order history can't automatically reflect product name corrections. If "Classic Burgur" was misspelled and later corrected to "Classic Burger", old orders still show the misspelled name. This is usually acceptable — receipts don't retroactively change.
+
+---
+
+## 45. order-service — JPA Auditing (@CreatedDate / @LastModifiedDate)
+
+### What it does
+Automatically populates `createdAt` and `updatedAt` timestamps without any manual code.
+
+### Setup
+**Step 1 — Enable auditing on the application class:**
+```java
+@SpringBootApplication
+@EnableJpaAuditing        // ← activates the auditing infrastructure
+public class OrderServiceApplication { ... }
+```
+
+**Step 2 — Register the listener on the entity:**
+```java
+@Entity
+@EntityListeners(AuditingEntityListener.class)   // ← wires auditing to this entity
+public class Order {
+    @CreatedDate
+    @Column(updatable = false)   // ← prevents this from being changed after creation
+    private LocalDateTime createdAt;
+
+    @LastModifiedDate
+    private LocalDateTime updatedAt;   // ← updated on every save
+}
+```
+
+### How it works
+- When `orderRepository.save(order)` is called for the first time: JPA sets `createdAt = now()` and `updatedAt = now()`
+- On subsequent saves (e.g., when the Kafka consumer changes status to CONFIRMED): JPA sets `updatedAt = now()`, `createdAt` is unchanged because of `updatable = false`
+
+### Why `updatable = false` on createdAt
+Without it, Hibernate's UPDATE statement could overwrite `createdAt`. The `updatable = false` constraint tells Hibernate to exclude this column from UPDATE statements — it only appears in the INSERT.
+
+### Why this matters in the async Kafka flow
+The `updatedAt` field tells you when the order status was last changed. When an order goes from `PENDING` to `CONFIRMED`, the `updatedAt` timestamp advances. This creates a natural audit trail:
+- `createdAt`: when the customer clicked "Place Order"
+- `updatedAt`: when payment was confirmed (or failed)
+
+---
+
+## 46. order-service — Service-to-Service Clients
+
+Both `CartClient` and `PaymentClient` use `ServiceTokenProvider` to generate a fresh 60-second ROLE_SERVICE JWT for every call.
+
+### CartClient
+```java
+@Component
+public class CartClient {
+
+    public CartResponse getCart(String username) {
+        return restClient.get()
+                .uri(cartServiceUrl + "/cart/internal/" + username)
+                .header("Authorization", "Bearer " + serviceTokenProvider.token())
+                .retrieve()
+                .body(CartResponse.class);
+    }
+
+    public void clearCart(String username) {
+        restClient.delete()
+                .uri(cartServiceUrl + "/cart/internal/" + username)
+                .header("Authorization", "Bearer " + serviceTokenProvider.token())
+                .retrieve()
+                .toBodilessEntity();
+    }
+}
+```
+
+The `/cart/internal/{username}` endpoint is protected by `@PreAuthorize("hasRole('SERVICE')")` in cart-service. Without the service token, this returns 403. The user's own token (ROLE_USER) would also be rejected.
+
+### PaymentClient — non-fatal error handling
+```java
+@Component
+public class PaymentClient {
+
+    public void initiatePayment(InitiatePaymentRequest request) {
+        try {
+            restClient.post()
+                    .uri(paymentServiceUrl + "/payments")
+                    .header("Authorization", "Bearer " + serviceTokenProvider.token())
+                    .header("Content-Type", "application/json")
+                    .body(request)
+                    .retrieve()
+                    .toBodilessEntity();
+        } catch (Exception ex) {
+            // Non-fatal: order stays PENDING. Kafka consumer will handle the status update.
+            log.error("Failed to initiate payment for order {}: {}", request.orderId(), ex.getMessage());
+        }
+    }
+}
+```
+
+**Why swallow the exception here?**
+The order has already been saved to the database and the cart has been cleared. If payment initiation fails (e.g., payment-service is temporarily down), we don't want to crash the order creation flow — the order is valid, it just needs payment. The order stays `PENDING` permanently until:
+1. Payment-service comes back up and processes the payment, OR
+2. The user or admin cancels the order manually
+
+This is the correct behavior for an async architecture — the order lifecycle is decoupled from the payment lifecycle.
+
+### InitiatePaymentRequest
+```java
+public record InitiatePaymentRequest(Long orderId, BigDecimal amount, String username) {}
+```
+
+order-service sends `orderId`, `amount` (total), and `username` to payment-service. payment-service uses these to create the `Payment` record.
+
+---
+
+## 47. order-service — Service Layer: Order Creation Flow
+
+```java
+@Transactional
+public OrderResponse createOrder(String username, CreateOrderRequest request) {
+
+    // Step 1: Fetch the user's cart from cart-service
+    CartResponse cart = cartClient.getCart(username);
+
+    // Step 2: Validate cart is not empty
+    if (cart.items() == null || cart.items().isEmpty()) {
+        throw new IllegalStateException("Cannot place an order with an empty cart");
+    }
+
+    // Step 3: Build Order entity with price snapshots from cart
+    Order order = new Order(username, cart.total(), request.shippingAddress());
+    cart.items().forEach(item -> {
+        order.getItems().add(new OrderItem(
+                order, item.productId(), item.productName(),
+                item.price(), item.quantity(), item.subtotal()));
+    });
+
+    // Step 4: Save order (+ all OrderItems via CascadeType.ALL)
+    Order saved = orderRepository.save(order);
+
+    // Step 5: Clear the cart — only AFTER the order is persisted
+    cartClient.clearCart(username);
+
+    // Step 6: Trigger payment — fire and forget, order stays PENDING
+    paymentClient.initiatePayment(
+            new InitiatePaymentRequest(saved.getId(), saved.getTotalAmount(), username));
+
+    // Step 7: Return the PENDING order to the client immediately
+    return toResponse(saved);
+}
+```
+
+**Why clear the cart AFTER saving the order?**
+If order save fails, the cart should remain intact — the user can try again. If we cleared the cart first, a DB failure would leave the user with no cart and no order.
+
+**Why the method is `@Transactional`?**
+The `orderRepository.save(order)` and all OrderItem inserts must succeed or fail together. If one item fails to persist, the whole order rolls back. `@Transactional` ensures atomicity at the database level.
+
+**Note:** `cartClient.clearCart()` is outside the JPA transaction — it's an HTTP call to another service. If cart clearing fails after the order is saved, the user will see their cart still populated but the order exists. This is a known trade-off in distributed systems. A proper solution would use a saga pattern with compensating transactions.
+
+### getOrder — ownership enforcement
+Regular users can only see their own orders. Admins can see any order:
+
+```java
+public OrderResponse getOrder(String username, Long orderId, boolean isAdmin) {
+    if (isAdmin) {
+        return toResponse(orderRepository.findById(orderId)
+                .orElseThrow(() -> new OrderNotFoundException("Order not found: " + orderId)));
+    }
+    // Non-admin: must be their order
+    return toResponse(orderRepository.findByIdAndUsername(orderId, username)
+            .orElseThrow(() -> new OrderNotFoundException("Order not found: " + orderId)));
+}
+```
+
+### cancelOrder — only PENDING orders can be cancelled
+Once payment is confirmed (`CONFIRMED`) the order is in-flight. Cancelling a confirmed order would require a refund flow — out of scope here:
+
+```java
+if (order.getStatus() != OrderStatus.PENDING) {
+    throw new IllegalStateException(
+        "Only PENDING orders can be cancelled. Current status: " + order.getStatus());
+}
+order.setStatus(OrderStatus.CANCELLED);
+```
+
+---
+
+## 48. order-service — Kafka Consumer
+
+### Why Kafka for order status updates (not a synchronous callback)
+
+**Option A — payment-service calls order-service back via REST:**
+- Tight coupling: payment-service must know order-service's URL
+- If order-service is down when payment finishes, the status update is lost
+- Retry logic must be implemented manually
+
+**Option B — Kafka event (what we use):**
+- Loose coupling: payment-service only knows the topic name, not any service URL
+- If order-service is down, Kafka retains the message — it will be consumed when order-service restarts
+- New consumers (notification-service, inventory-service) can subscribe to the same topic without changing payment-service
+
+### KafkaConsumerConfig (required in Spring Boot 4)
+
+Spring Boot 4 does NOT auto-create `kafkaListenerContainerFactory`. Both `@EnableKafka` and an explicit `@Configuration` providing the factory bean are required:
+
+```java
+// OrderServiceApplication.java
+@SpringBootApplication
+@EnableJpaAuditing
+@EnableKafka           // ← REQUIRED in Spring Boot 4 — enables @KafkaListener processing
+public class OrderServiceApplication { ... }
+```
+
+```java
+// KafkaConsumerConfig.java
+@Configuration
+public class KafkaConsumerConfig {
+
+    @Value("${spring.kafka.bootstrap-servers}")
+    private String bootstrapServers;
+
+    @Bean
+    public ConsumerFactory<String, PaymentEvent> consumerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "order-service");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+        props.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
+        props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, PaymentEvent.class.getName());
+        props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, false);  // ← ignore __TypeId__ header
+        return new DefaultKafkaConsumerFactory<>(props);
+    }
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, PaymentEvent> kafkaListenerContainerFactory(
+            ConsumerFactory<String, PaymentEvent> consumerFactory) {
+        ConcurrentKafkaListenerContainerFactory<String, PaymentEvent> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory);
+        return factory;
+    }
+}
+```
+
+**`USE_TYPE_INFO_HEADERS = false` explained:**
+By default, Spring's `JsonSerializer` on the producer embeds a `__TypeId__` header in every Kafka message. The header contains the fully-qualified class name of the Java object (e.g., `com.fooddelivery.paymentservice.dto.PaymentEvent`). When the consumer tries to deserialize, it looks for that class. Since order-service doesn't have the `paymentservice` package, it throws `ClassNotFoundException`.
+
+Setting `USE_TYPE_INFO_HEADERS = false` tells the consumer to ignore the `__TypeId__` header and instead use `VALUE_DEFAULT_TYPE` (`com.fooddelivery.orderservice.dto.PaymentEvent`) — the local version of the same record.
+
+### PaymentEventConsumer
+```java
+@Component
+public class PaymentEventConsumer {
+
+    private static final Logger log = LoggerFactory.getLogger(PaymentEventConsumer.class);
+
+    @KafkaListener(topics = "payment-events", groupId = "order-service")
+    @Transactional
+    public void onPaymentEvent(PaymentEvent event) {
+        log.info("Received payment event: {} for order {}", event.eventType(), event.orderId());
+
+        Order order = orderRepository.findById(event.orderId()).orElse(null);
+        if (order == null) {
+            log.warn("Order {} not found for payment event — skipping", event.orderId());
+            return;
+        }
+
+        switch (event.eventType()) {
+            case "PAYMENT_SUCCESS" -> {
+                order.setStatus(OrderStatus.CONFIRMED);
+                log.info("Order {} confirmed after successful payment {}", order.getId(), event.paymentId());
+            }
+            case "PAYMENT_FAILED" -> {
+                order.setStatus(OrderStatus.CANCELLED);
+                log.info("Order {} cancelled after failed payment {}: {}",
+                        order.getId(), event.paymentId(), event.failureReason());
+            }
+            default -> log.warn("Unknown payment event type: {}", event.eventType());
+        }
+
+        orderRepository.save(order);
+    }
+}
+```
+
+### PaymentEvent record
+```java
+public record PaymentEvent(
+    String eventType,      // "PAYMENT_SUCCESS" or "PAYMENT_FAILED"
+    Long paymentId,        // payment-service's payment ID
+    Long orderId,          // which order this payment is for
+    String username,       // customer
+    BigDecimal amount,
+    String failureReason   // null on success
+) {}
+```
+
+This record exists in **both** order-service and payment-service with the same field structure — they are intentionally separate classes (no shared library). The consumer ignores the type header and deserializes using its own local class.
+
+---
+
+## 49. order-service — Controller
+
+```java
+@RestController
+@RequestMapping("/orders")
+public class OrderController {
+
+    @PostMapping
+    public ResponseEntity<OrderResponse> createOrder(Authentication auth,
+                                                     @Valid @RequestBody CreateOrderRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(orderService.createOrder(auth.getName(), request));
+    }
+
+    @GetMapping
+    public ResponseEntity<List<OrderResponse>> getMyOrders(Authentication auth) {
+        return ResponseEntity.ok(orderService.getMyOrders(auth.getName()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<OrderResponse> getOrder(Authentication auth, @PathVariable Long id) {
+        boolean isAdmin = auth.getAuthorities().stream()
+                .anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN"));
+        return ResponseEntity.ok(orderService.getOrder(auth.getName(), id, isAdmin));
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<OrderResponse> cancelOrder(Authentication auth, @PathVariable Long id) {
+        boolean isAdmin = auth.getAuthorities().stream()
+                .anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN"));
+        return ResponseEntity.ok(orderService.cancelOrder(auth.getName(), id, isAdmin));
+    }
+}
+```
+
+**Why `Authentication` instead of `Principal`?**
+`Authentication` gives you both `getName()` (username) and `getAuthorities()` (roles). `Principal` only gives you `getName()`. The controller needs both to decide whether to show all orders or only the user's own orders.
+
+**Why `DELETE` for cancel, not `PATCH`?**
+Semantically, `PATCH /orders/{id}` would be more RESTful for status changes. `DELETE` is used here for simplicity — in a real system `PATCH /orders/{id} {"status":"CANCELLED"}` or a dedicated `POST /orders/{id}/cancel` endpoint would be cleaner.
+
+### Endpoint summary
+
+| Endpoint | Auth | What it does |
+|---|---|---|
+| `POST /orders` | Required | Create order from current cart |
+| `GET /orders` | Required | List caller's orders (most recent first) |
+| `GET /orders/{id}` | Required | Get specific order (admin sees any, user sees own) |
+| `DELETE /orders/{id}` | Required | Cancel PENDING order (admin can cancel any) |
+
+---
+
+## 50. order-service — API Usage with curl
+
+```bash
+# --- Get token ---
+TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"password123"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+# --- Add items to cart first ---
+curl -s -X POST http://localhost:8080/cart/items \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"productId":1,"quantity":2}'
+
+curl -s -X POST http://localhost:8080/cart/items \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"productId":3,"quantity":1}'
+
+# --- Place order ---
+curl -s -X POST http://localhost:8080/orders \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"shippingAddress":"123 Main St, Springfield"}'
+# → {"id":4,"username":"alice","status":"PENDING","totalAmount":28.97,...}
+# Cart is now cleared automatically
+
+# Wait ~5 seconds for Kafka event to arrive, then:
+
+# --- Check order status ---
+curl -s http://localhost:8080/orders/4 \
+  -H "Authorization: Bearer $TOKEN"
+# → {"id":4,"status":"CONFIRMED",...}  ← updated by Kafka consumer
+
+# --- List all my orders ---
+curl -s http://localhost:8080/orders \
+  -H "Authorization: Bearer $TOKEN"
+# → [{"id":4,...},{"id":3,...}]  ← most recent first
+
+# --- Cancel a PENDING order ---
+curl -s -X DELETE http://localhost:8080/orders/4 \
+  -H "Authorization: Bearer $TOKEN"
+# → {"id":4,"status":"CANCELLED",...}   (only works if still PENDING)
+
+# --- Empty cart → 500 ---
+curl -s -X POST http://localhost:8080/orders \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"shippingAddress":"Test"}'
+# → {"error":"Cannot place an order with an empty cart"}
+```
+
+---
+
+## 51. payment-service — Overview and Structure
+
+Runs on port 8085. Handles payment processing for orders. Stores payments in **PostgreSQL** (`paymentdb` — separate from `orderdb`). Produces Kafka events to the `payment-events` topic after each payment outcome. Only order-service can initiate payments (protected by `ROLE_SERVICE`).
+
+```
+payment-service/
+├── config/
+│   ├── JwtAuthFilter.java      — JWT filter (same pattern as other services)
+│   ├── KafkaProducerConfig.java — typed KafkaTemplate<String, PaymentEvent> bean
+│   └── SecurityConfig.java     — @EnableMethodSecurity for ROLE_SERVICE guard
+├── controller/
+│   └── PaymentController.java  — POST /payments (SERVICE only), GET /payments/{id}
+├── dto/
+│   ├── InitiatePaymentRequest.java — record: orderId, amount, username
+│   ├── PaymentEvent.java           — record: Kafka message payload
+│   └── PaymentResponse.java        — record: response to caller
+├── entity/
+│   ├── Payment.java            — JPA entity with @EnableJpaAuditing
+│   └── PaymentStatus.java      — PENDING, SUCCESS, FAILED
+├── exception/
+│   ├── GlobalExceptionHandler.java
+│   └── PaymentNotFoundException.java
+├── repository/
+│   └── PaymentRepository.java  — findByOrderId custom query
+├── service/
+│   └── PaymentService.java     — payment flow + Kafka publish
+└── util/
+    └── JwtUtil.java
+```
+
+### Port allocation and database
+| Service | Port | Database | Why separate DB? |
+|---|---|---|---|
+| payment-service | 8085 | PostgreSQL `paymentdb` | Financial data needs isolation; separate backup/compliance policies |
+
+### application.properties
+```properties
+spring.application.name=payment-service
+server.port=8085
+spring.datasource.url=jdbc:postgresql://localhost:5432/paymentdb
+spring.datasource.username=postgres
+spring.datasource.password=password
+spring.jpa.hibernate.ddl-auto=update
+jwt.secret=5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+spring.kafka.bootstrap-servers=localhost:9092
+```
+
+Docker profile (`application-docker.properties`):
+```properties
+spring.datasource.url=jdbc:postgresql://postgres:5432/paymentdb
+spring.kafka.bootstrap-servers=kafka:9092
+```
+
+**Creating paymentdb in Docker (one-time):**
+```bash
+docker exec ecommerce-postgres psql -U postgres -c "CREATE DATABASE paymentdb;"
+```
+
+---
+
+## 52. payment-service — Entity Design: Payment and PaymentStatus
+
+### PaymentStatus
+```java
+public enum PaymentStatus {
+    PENDING,   // payment record created, processing not yet complete
+    SUCCESS,   // payment processed successfully
+    FAILED     // processing failed (insufficient funds, gateway error, etc.)
+}
+```
+
+### Payment entity
+```java
+@Entity
+@Table(name = "payments")
+@EntityListeners(AuditingEntityListener.class)
+public class Payment {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false)
+    private Long orderId;           // foreign key into order-service (logical, not JPA join)
+
+    @Column(nullable = false)
+    private String username;        // the customer
+
+    @Column(nullable = false, precision = 10, scale = 2)
+    private BigDecimal amount;      // amount charged
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private PaymentStatus status;   // starts PENDING, updated to SUCCESS or FAILED
+
+    private String failureReason;   // null on success; populated on failure
+
+    @CreatedDate @Column(updatable = false)
+    private LocalDateTime createdAt;
+
+    @LastModifiedDate
+    private LocalDateTime updatedAt;
+}
+```
+
+### Why `orderId` is a plain `Long` (not `@ManyToOne Order`)
+`orderId` is a **logical foreign key** — not a JPA relationship. payment-service has no `Order` entity; that lives in order-service's database. In a microservices architecture, services don't share database tables. The `orderId` is just a number that can be used to correlate payments to orders across services.
+
+Using `@ManyToOne Order` here would require payment-service to import order-service's entity class, which would couple the services at the code level — exactly what microservices avoid.
+
+---
+
+## 53. payment-service — Kafka Producer
+
+### Why an explicit KafkaProducerConfig is needed
+
+Spring Boot auto-configuration provides `KafkaTemplate<Object, Object>` (using `Object` generic types). If you inject `KafkaTemplate<String, PaymentEvent>` directly, Spring cannot find a matching bean — it needs exact generic type matching.
+
+The fix is to define your own typed `ProducerFactory` and `KafkaTemplate` beans:
+
+```java
+@Configuration
+public class KafkaProducerConfig {
+
+    @Value("${spring.kafka.bootstrap-servers}")
+    private String bootstrapServers;
+
+    @Bean
+    public ProducerFactory<String, PaymentEvent> producerFactory() {
+        return new DefaultKafkaProducerFactory<>(Map.of(
+                ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers,
+                ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class,
+                JsonSerializer.ADD_TYPE_INFO_HEADERS, false   // ← don't embed __TypeId__ header
+        ));
+    }
+
+    @Bean
+    public KafkaTemplate<String, PaymentEvent> kafkaTemplate(
+            ProducerFactory<String, PaymentEvent> producerFactory) {
+        return new KafkaTemplate<>(producerFactory);
+    }
+}
+```
+
+### `ADD_TYPE_INFO_HEADERS = false` explained
+By default, `JsonSerializer` adds a `__TypeId__` header to every Kafka message containing the Java class name (`com.fooddelivery.paymentservice.dto.PaymentEvent`). The consumer (order-service) doesn't have this class in its classpath — it has its own `com.fooddelivery.orderservice.dto.PaymentEvent`. If the consumer uses the header to determine the deserialization type, it throws `ClassNotFoundException`.
+
+Setting `ADD_TYPE_INFO_HEADERS = false` prevents the producer from embedding the header. The consumer then uses its configured `VALUE_DEFAULT_TYPE` to deserialize the JSON into its own local class.
+
+### Message partitioning
+```java
+kafkaTemplate.send(TOPIC, String.valueOf(event.orderId()), event);
+//                          ↑ partition key
+```
+
+Using `orderId` as the Kafka partition key ensures that all events for the same order are routed to the same partition. Within a partition, Kafka guarantees order. This means if there are multiple payment attempts for the same order, the consumer processes them in order.
+
+---
+
+## 54. payment-service — Service Layer: Payment Flow
+
+```java
+@Service
+public class PaymentService {
+
+    private static final String TOPIC = "payment-events";
+
+    @Transactional
+    public PaymentResponse initiatePayment(InitiatePaymentRequest request) {
+
+        // Step 1: Create payment record in PENDING state
+        Payment payment = new Payment(request.orderId(), request.username(), request.amount());
+        paymentRepository.save(payment);
+
+        try {
+            // Step 2: Process payment
+            // Currently a stub — always succeeds.
+            // Replace with Stripe/PayPal/Braintree SDK call here.
+            process(payment);
+
+            // Step 3a: Payment succeeded — update status
+            payment.setStatus(PaymentStatus.SUCCESS);
+            paymentRepository.save(payment);
+
+            // Step 4a: Publish PAYMENT_SUCCESS event to Kafka
+            publish(new PaymentEvent(
+                    "PAYMENT_SUCCESS", payment.getId(), payment.getOrderId(),
+                    payment.getUsername(), payment.getAmount(), null));
+
+        } catch (Exception ex) {
+            // Step 3b: Payment failed — record the reason
+            payment.setStatus(PaymentStatus.FAILED);
+            payment.setFailureReason(ex.getMessage());
+            paymentRepository.save(payment);
+
+            // Step 4b: Publish PAYMENT_FAILED event to Kafka
+            publish(new PaymentEvent(
+                    "PAYMENT_FAILED", payment.getId(), payment.getOrderId(),
+                    payment.getUsername(), payment.getAmount(), ex.getMessage()));
+        }
+
+        return toResponse(payment);
+    }
+
+    private void process(Payment payment) {
+        // Stub — replace with real payment gateway integration.
+        // Throw RuntimeException to simulate a failure.
+    }
+
+    private void publish(PaymentEvent event) {
+        kafkaTemplate.send(TOPIC, String.valueOf(event.orderId()), event);
+        log.debug("Published {} to topic {}", event.eventType(), TOPIC);
+    }
+}
+```
+
+### Two saves — why?
+`paymentRepository.save(payment)` is called twice in the success path:
+1. First save: `status = PENDING` — establishes the payment record before processing starts. If the app crashes mid-processing, we have a record.
+2. Second save: `status = SUCCESS` — updates after processing completes.
+
+This gives a complete audit trail — you can see payments that started processing but never completed (they stay `PENDING` in the DB).
+
+### Simulating a payment failure (for testing)
+To test the `PAYMENT_FAILED` → order `CANCELLED` flow, throw an exception in `process()`:
+
+```java
+private void process(Payment payment) {
+    throw new RuntimeException("Insufficient funds");
+}
+```
+
+Then restart payment-service. The next order will fail payment and order-service's Kafka consumer will set the order to `CANCELLED`.
+
+---
+
+## 55. payment-service — Security: ROLE_SERVICE Guard
+
+The `POST /payments` endpoint must only be callable by order-service — not by users or external clients. The protection is `@PreAuthorize("hasRole('SERVICE')")`:
+
+```java
+@PreAuthorize("hasRole('SERVICE')")
+@PostMapping
+public ResponseEntity<PaymentResponse> initiatePayment(@Valid @RequestBody InitiatePaymentRequest request) {
+    return ResponseEntity.status(HttpStatus.CREATED).body(paymentService.initiatePayment(request));
+}
+```
+
+order-service calls this endpoint with its `ServiceTokenProvider` token (60s JWT with `role: ROLE_SERVICE`). A user's JWT has `role: ROLE_USER` or `role: ROLE_ADMIN` — neither passes the `hasRole('SERVICE')` check.
+
+The GET endpoints have no role restriction — any authenticated user can look up payment status for any payment ID. A more restrictive design would also guard these by ownership (only the order owner can see their payment).
+
+### Why this endpoint is NOT exposed via api-gateway
+
+The api-gateway routes table does not include a route for `POST /payments`. Even if a user guesses the URL, the gateway's `RoutingFilter` returns 404 because there's no route match. The service-to-service call goes directly over the Docker internal network (`http://payment-service:8085`), bypassing the gateway entirely.
+
+This is intentional: internal service endpoints should never be reachable from the internet.
+
+---
+
+## 56. payment-service — Controller
+
+```java
+@RestController
+@RequestMapping("/payments")
+public class PaymentController {
+
+    // Only order-service (ROLE_SERVICE) can create a payment
+    @PreAuthorize("hasRole('SERVICE')")
+    @PostMapping
+    public ResponseEntity<PaymentResponse> initiatePayment(
+            @Valid @RequestBody InitiatePaymentRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(paymentService.initiatePayment(request));
+    }
+
+    // Any authenticated user can look up payment by payment ID
+    @GetMapping("/{id}")
+    public ResponseEntity<PaymentResponse> getById(@PathVariable Long id) {
+        return ResponseEntity.ok(paymentService.getById(id));
+    }
+
+    // Look up payment by order ID (useful from order-service or admin tools)
+    @GetMapping("/order/{orderId}")
+    public ResponseEntity<PaymentResponse> getByOrderId(@PathVariable Long orderId) {
+        return ResponseEntity.ok(paymentService.getByOrderId(orderId));
+    }
+}
+```
+
+### PaymentResponse record
+```java
+public record PaymentResponse(
+    Long id,
+    Long orderId,
+    String username,
+    BigDecimal amount,
+    PaymentStatus status,
+    String failureReason,       // null on success
+    LocalDateTime createdAt,
+    LocalDateTime updatedAt
+) {}
+```
+
+---
+
+## 57. payment-service — Complete Async Flow End-to-End
+
+This is the complete sequence from "user clicks place order" to "order is confirmed":
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│  Step 1 — User places order                                                │
+│                                                                            │
+│  POST /orders                                                              │
+│  Authorization: Bearer <user-jwt>                                          │
+│        │                                                                   │
+│        ▼                                                                   │
+│  api-gateway validates JWT → forwards to order-service:8084                │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│  Step 2 — order-service fetches and clears the cart                        │
+│                                                                            │
+│  CartClient.getCart("alice")                                               │
+│    → GET http://cart-service:8083/cart/internal/alice                      │
+│       Authorization: Bearer <service-jwt sub=order-service, role=SERVICE>  │
+│    ← CartResponse{items=[...], total=28.97}                                │
+│                                                                            │
+│  Order saved to PostgreSQL orderdb (status=PENDING)                        │
+│                                                                            │
+│  CartClient.clearCart("alice")                                             │
+│    → DELETE http://cart-service:8083/cart/internal/alice                   │
+│       Authorization: Bearer <service-jwt>                                  │
+│    ← 204 No Content                                                        │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│  Step 3 — order-service triggers payment (fire and forget)                 │
+│                                                                            │
+│  PaymentClient.initiatePayment(orderId=4, amount=28.97, username="alice")  │
+│    → POST http://payment-service:8085/payments                             │
+│       Authorization: Bearer <service-jwt sub=order-service, role=SERVICE>  │
+│                                                                            │
+│  order-service returns 201 CREATED to client immediately                   │
+│  → {"id":4,"status":"PENDING",...}                                         │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│  Step 4 — payment-service processes the payment                            │
+│                                                                            │
+│  Payment saved to PostgreSQL paymentdb (status=PENDING)                    │
+│  process() stub runs → always succeeds                                     │
+│  Payment updated (status=SUCCESS)                                          │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│  Step 5 — payment-service publishes Kafka event                            │
+│                                                                            │
+│  kafkaTemplate.send("payment-events", "4", PaymentEvent{                   │
+│      eventType: "PAYMENT_SUCCESS",                                         │
+│      paymentId: 2,                                                         │
+│      orderId: 4,                                                           │
+│      username: "alice",                                                    │
+│      amount: 28.97                                                         │
+│  })                                                                        │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│  Step 6 — order-service Kafka consumer processes the event                 │
+│                                                                            │
+│  @KafkaListener topic="payment-events" groupId="order-service"             │
+│  PaymentEventConsumer.onPaymentEvent(event)                                │
+│    → order = orderRepository.findById(4)                                   │
+│    → order.setStatus(CONFIRMED)                                            │
+│    → orderRepository.save(order)                                           │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│  Step 7 — User polls and sees CONFIRMED                                    │
+│                                                                            │
+│  GET /orders/4                                                             │
+│  ← {"id":4,"status":"CONFIRMED","updatedAt":"2026-05-19T15:24:09"}         │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Timeline:**
+- Steps 1-3 (request to response): ~300ms (synchronous HTTP calls)
+- Steps 4-6 (async Kafka flow): ~3-8 seconds (Kafka propagation + consumer poll interval)
+- Step 7: user gets CONFIRMED on next poll after ~5-8 seconds
+
+---
+
+## 58. payment-service — API Usage with curl
+
+```bash
+# The POST endpoint requires a ROLE_SERVICE token — not normally callable directly.
+# You trigger it by placing an order, which calls it internally.
+
+# --- Look up payment by ID (any authenticated user) ---
+TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"password123"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+curl -s http://localhost:8080/payments/1 \
+  -H "Authorization: Bearer $TOKEN"
+# → {"id":1,"orderId":3,"username":"alice","amount":28.97,
+#    "status":"SUCCESS","failureReason":null,
+#    "createdAt":"2026-05-19T14:45:59","updatedAt":"2026-05-19T14:46:01"}
+
+# --- Look up payment by order ID ---
+curl -s http://localhost:8080/payments/order/3 \
+  -H "Authorization: Bearer $TOKEN"
+# → same response
+
+# --- Direct call to payment-service (bypassing gateway) ---
+# Useful during development when testing payment-service in isolation
+curl -s http://localhost:8085/payments/1 \
+  -H "Authorization: Bearer $TOKEN"
+
+# --- Payment not found → 404 ---
+curl -s http://localhost:8080/payments/9999 \
+  -H "Authorization: Bearer $TOKEN"
+# → {"error":"Payment not found: 9999"}
+```
+
+---
+
+## 59. Common Errors and Fixes (cart/order/payment/Kafka)
+
+### MySQL port 3306 conflict
+```
+[08S01] Communications link failure
+```
+**Cause:** A local MySQL installation is already bound to port 3306. Docker cannot expose its MySQL on the same host port.
+
+**Fix:** Remap the host port in `docker-compose.yml`:
+```yaml
+mysql:
+  ports:
+    - "3307:3306"   # host:container — container still uses 3306 internally
+```
+Services inside the Docker network still reach MySQL via `mysql:3306` (the container port). Only external connections (e.g., MySQL Workbench from your laptop) use the remapped `localhost:3307`.
+
+---
+
+### bitnami/kafka image not found
+```
+Error response from daemon: manifest for bitnami/kafka:3.7 not found
+```
+**Cause:** `bitnami/kafka:3.7` (without a patch version) doesn't exist on Docker Hub. Also, Bitnami Kafka images with specific versions are sometimes unavailable in certain regions.
+
+**Fix:** Use Apache's official image in KRaft mode (no ZooKeeper):
+```yaml
+kafka:
+  image: apache/kafka:3.7.0   # official Apache image
+  environment:
+    KAFKA_NODE_ID: 1
+    KAFKA_PROCESS_ROLES: broker,controller
+    KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+    KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"   # must be a stable base64 UUID
+```
+
+---
+
+### KafkaTemplate bean not found — wrong generic type
+```
+NoSuchBeanDefinitionException: No qualifying bean of type
+'org.springframework.kafka.core.KafkaTemplate<java.lang.String, PaymentEvent>'
+```
+**Cause:** Spring Boot auto-configuration only creates `KafkaTemplate<Object, Object>`. Injecting a typed `KafkaTemplate<String, PaymentEvent>` fails because the generic type doesn't match.
+
+**Fix:** Define explicit typed beans in a `@Configuration` class:
+```java
+@Bean
+public ProducerFactory<String, PaymentEvent> producerFactory() {
+    return new DefaultKafkaProducerFactory<>(Map.of(
+            ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers,
+            ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+            ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class,
+            JsonSerializer.ADD_TYPE_INFO_HEADERS, false
+    ));
+}
+
+@Bean
+public KafkaTemplate<String, PaymentEvent> kafkaTemplate(
+        ProducerFactory<String, PaymentEvent> producerFactory) {
+    return new KafkaTemplate<>(producerFactory);
+}
+```
+
+---
+
+### @KafkaListener silently ignored — no consumer logs at startup (Spring Boot 4)
+**Symptom:** The service starts successfully but there are no Kafka consumer initialization logs. `@KafkaListener` methods never fire.
+
+**Cause:** In Spring Boot 4, `@EnableKafka` is NOT auto-applied. Without it, `@KafkaListener` annotation processing is never activated.
+
+Additionally, Spring Boot 4 does NOT auto-create `kafkaListenerContainerFactory`. If the bean is missing, the app fails on startup with `NoSuchBeanDefinitionException: No bean named 'kafkaListenerContainerFactory' available`.
+
+**Fix — two things required together:**
+
+1. Add `@EnableKafka` to the application class:
+```java
+@SpringBootApplication
+@EnableJpaAuditing
+@EnableKafka        // ← required in Spring Boot 4
+public class OrderServiceApplication { ... }
+```
+
+2. Provide explicit `kafkaListenerContainerFactory` bean:
+```java
+@Configuration
+public class KafkaConsumerConfig {
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, PaymentEvent> kafkaListenerContainerFactory(
+            ConsumerFactory<String, PaymentEvent> consumerFactory) {
+        ConcurrentKafkaListenerContainerFactory<String, PaymentEvent> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory);
+        return factory;
+    }
+}
+```
+
+---
+
+### Kafka deserialization fails — ClassNotFoundException
+```
+Caused by: java.lang.ClassNotFoundException: com.fooddelivery.paymentservice.dto.PaymentEvent
+```
+**Cause:** Spring's `JsonSerializer` embeds a `__TypeId__` Kafka header containing the producer's fully-qualified class name. The consumer tries to find `com.fooddelivery.paymentservice.dto.PaymentEvent` — a class that doesn't exist in the order-service classpath.
+
+**Fix — two parts:**
+
+On the **producer** (payment-service): don't embed the type header:
+```java
+JsonSerializer.ADD_TYPE_INFO_HEADERS, false
+```
+
+On the **consumer** (order-service): ignore the header even if present, use local type:
+```java
+props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, false);
+props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, PaymentEvent.class.getName());
+```
+
+Both services have their own local `PaymentEvent` record with identical fields. JSON deserialization succeeds because the field names match, regardless of the class package.
+
+---
+
+### paymentdb does not exist
+```
+FATAL: database "paymentdb" does not exist
+```
+**Cause:** PostgreSQL only auto-creates a database if you configure it in `POSTGRES_DB`. The docker-compose file sets `POSTGRES_DB: orderdb` — `paymentdb` was never created.
+
+**Fix:** Create it manually (one-time):
+```bash
+docker exec ecommerce-postgres psql -U postgres -c "CREATE DATABASE paymentdb;"
+```
+
+Or add it to `docker-compose.yml` using PostgreSQL's init scripts:
+```yaml
+postgres:
+  environment:
+    POSTGRES_DB: orderdb       # primary DB
+    POSTGRES_MULTIPLE_DATABASES: "orderdb,paymentdb"  # requires custom init script
+```
+
+---
+
+### Cart internal endpoint returns 403 for order-service
+**Cause:** The internal endpoints use `@PreAuthorize("hasRole('SERVICE')")`, but `@EnableMethodSecurity` is missing from `SecurityConfig`.
+
+**Fix:** Add `@EnableMethodSecurity` to `SecurityConfig`:
+```java
+@Configuration
+@EnableMethodSecurity   // ← activates @PreAuthorize
+public class SecurityConfig { ... }
+```
+Without it, `@PreAuthorize` is silently ignored and all authenticated requests pass. With `ROLE_USER` or `ROLE_ADMIN` tokens, the method would run for anyone — or with `anyRequest().authenticated()`, everyone authenticated could call internal endpoints.
+
+---
+
+### Order stays PENDING forever — Kafka consumer not receiving events
+**Diagnostic steps:**
+```bash
+# 1. Check if payment-service actually published the event
+docker compose logs payment-service | grep "Published"
+
+# 2. Check if order-service consumer is subscribed
+docker compose logs order-service | grep "Subscribed to topic"
+
+# 3. Check for consumer errors
+docker compose logs order-service | grep -i "error\|exception"
+
+# 4. Check the topic exists in Kafka
+docker exec ecommerce-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:9092 --list
+
+# 5. Check consumer group lag
+docker exec ecommerce-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:9092 \
+  --describe --group order-service
+```
+
+**Common causes:**
+- `@EnableKafka` missing on order-service application class → consumer never starts
+- `kafkaListenerContainerFactory` bean missing → startup failure
+- `USE_TYPE_INFO_HEADERS = false` missing → deserialization fails, consumer crashes on every message
+- `payment-events` topic has messages with bad type headers (from before the fix) → delete topic and retry
+
+**Delete and recreate the topic to clear bad messages:**
+```bash
+docker exec ecommerce-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:9092 --delete --topic payment-events
+# Kafka auto-creates it fresh on the next send
 ```

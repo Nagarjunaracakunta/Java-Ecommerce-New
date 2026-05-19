@@ -70,7 +70,13 @@ public class RoutingFilter implements WebFilter {
                 .exchangeToMono(clientResponse -> {
                     ServerHttpResponse response = exchange.getResponse();
                     response.setStatusCode(clientResponse.statusCode());
-                    response.getHeaders().addAll(clientResponse.headers().asHttpHeaders());
+                    HttpHeaders backendHeaders = clientResponse.headers().asHttpHeaders();
+                    backendHeaders.forEach((name, values) -> {
+                        // Skip hop-by-hop headers — the gateway manages its own transfer encoding
+                        if (!name.equalsIgnoreCase(HttpHeaders.TRANSFER_ENCODING)) {
+                            response.getHeaders().addAll(name, values);
+                        }
+                    });
                     return response.writeWith(clientResponse.bodyToFlux(DataBuffer.class));
                 })
                 .onErrorResume(ex -> backendError(exchange, ex));

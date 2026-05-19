@@ -1,7 +1,26 @@
+# Build artifacts — each module has its own target/
+*/target/
 target/
+
+# Version control
 .git/
+.gitignore
+
+# IDE
 .idea/
 *.iml
+**/.settings/
+**/.classpath
+**/.project
+
+# Maven wrapper (not needed in Docker — uses installed mvn)
 .mvn/
 mvnw
 mvnw.cmd
+
+# Test coverage and reports
+**/jacoco.exec
+**/surefire-reports/
+
+# Docs (not needed in image)
+*.md

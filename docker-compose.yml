@@ -1,4 +1,85 @@
 services:
+
+  # ── MySQL ─────────────────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: ecommerce-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: ecommerce
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "--password=password"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - ecommerce-network
+
+  # ── auth-service ──────────────────────────────────────────────────────────────
+  auth-service:
+    build:
+      context: .
+      dockerfile: auth-service/Dockerfile
+    container_name: ecommerce-auth
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/ecommerce?createDatabaseIfNotExist=true
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: password
+      JWT_SECRET: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+      JWT_EXPIRATION_MS: 86400000
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: on-failure
+    networks:
+      - ecommerce-network
+
+  # ── product-service ───────────────────────────────────────────────────────────
+  product-service:
+    build:
+      context: .
+      dockerfile: product-service/Dockerfile
+    container_name: ecommerce-products
+    ports:
+      - "8082:8082"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/ecommerce?createDatabaseIfNotExist=true
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: password
+      JWT_SECRET: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: on-failure
+    networks:
+      - ecommerce-network
+
+  # ── api-gateway ───────────────────────────────────────────────────────────────
+  api-gateway:
+    build:
+      context: .
+      dockerfile: api-gateway/Dockerfile
+    container_name: ecommerce-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      JWT_SECRET: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+    depends_on:
+      - auth-service
+      - product-service
+    restart: on-failure
+    networks:
+      - ecommerce-network
+
+  # ── SonarQube ─────────────────────────────────────────────────────────────────
   sonarqube:
     image: sonarqube:lts-community
     container_name: sonarqube
@@ -13,14 +94,7 @@ services:
     networks:
       - ecommerce-network
 
-  app:
-    image: java-ecommerce:latest
-    container_name: java-ecommerce
-    ports:
-      - "8080:8080"
-    networks:
-      - ecommerce-network
-
+  # ── Jenkins ───────────────────────────────────────────────────────────────────
   jenkins:
     build: ./jenkins
     container_name: jenkins
@@ -39,6 +113,7 @@ networks:
     driver: bridge
 
 volumes:
+  mysql-data:
   sonarqube_data:
   sonarqube_logs:
   sonarqube_extensions:

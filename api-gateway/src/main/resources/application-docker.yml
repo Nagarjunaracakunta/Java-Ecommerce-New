@@ -1,0 +1,6 @@
+# Overrides application.yml when SPRING_PROFILES_ACTIVE=docker
+# Docker Compose service names resolve inside the ecommerce-net bridge network
+gateway:
+  routes:
+    "[/auth]": http://auth-service:8081
+    "[/products]": http://product-service:8082

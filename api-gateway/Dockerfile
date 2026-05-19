@@ -9,6 +9,7 @@ COPY api-gateway/pom.xml     api-gateway/
 COPY cart-service/pom.xml    cart-service/
 COPY order-service/pom.xml   order-service/
 COPY payment-service/pom.xml  payment-service/
+COPY notification-service/pom.xml notification-service/
 
 RUN mvn install -N -q
 RUN mvn dependency:go-offline -pl api-gateway -q

@@ -60,6 +60,17 @@ services:
     networks:
       - ecommerce-network
 
+  # ── MongoDB ───────────────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: ecommerce-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - ecommerce-network
+
   # ── Redis ─────────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
@@ -188,6 +199,26 @@ services:
     networks:
       - ecommerce-network
 
+  # ── notification-service ─────────────────────────────────────────────────────
+  notification-service:
+    build:
+      context: .
+      dockerfile: notification-service/Dockerfile
+    container_name: ecommerce-notifications
+    ports:
+      - "8087:8087"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      JWT_SECRET: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+      SPRING_MONGODB_URI: mongodb://mongodb:27017/notificationdb
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      - mongodb
+      - kafka
+    restart: on-failure
+    networks:
+      - ecommerce-network
+
   # ── SonarQube ─────────────────────────────────────────────────────────────────
   sonarqube:
     image: sonarqube:lts-community
@@ -225,6 +256,7 @@ volumes:
   postgres-data:
   redis-data:
   mysql-data:
+  mongodb-data:
   sonarqube_data:
   sonarqube_logs:
   sonarqube_extensions:

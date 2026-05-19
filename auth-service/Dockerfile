@@ -10,6 +10,7 @@ COPY api-gateway/pom.xml     api-gateway/
 COPY cart-service/pom.xml    cart-service/
 COPY order-service/pom.xml   order-service/
 COPY payment-service/pom.xml  payment-service/
+COPY notification-service/pom.xml notification-service/
 
 # Install parent pom to local repo (non-recursive — pom packaging only)
 RUN mvn install -N -q

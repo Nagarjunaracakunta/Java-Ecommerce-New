@@ -20,6 +20,15 @@ services:
     networks:
       - ecommerce-network
 
+  # ── Redis ─────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ecommerce-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - ecommerce-network
+
   # ── auth-service ──────────────────────────────────────────────────────────────
   auth-service:
     build:
@@ -79,6 +88,24 @@ services:
     networks:
       - ecommerce-network
 
+  # ── cart-service ─────────────────────────────────────────────────────────────
+  cart-service:
+    build:
+      context: .
+      dockerfile: cart-service/Dockerfile
+    container_name: ecommerce-cart
+    ports:
+      - "8083:8083"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      JWT_SECRET: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+    depends_on:
+      - redis
+      - product-service
+    restart: on-failure
+    networks:
+      - ecommerce-network
+
   # ── SonarQube ─────────────────────────────────────────────────────────────────
   sonarqube:
     image: sonarqube:lts-community
@@ -113,6 +140,7 @@ networks:
     driver: bridge
 
 volumes:
+  redis-data:
   mysql-data:
   sonarqube_data:
   sonarqube_logs:

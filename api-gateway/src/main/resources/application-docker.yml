@@ -4,3 +4,4 @@ gateway:
   routes:
     "[/auth]": http://auth-service:8081
     "[/products]": http://product-service:8082
+    "[/cart]": http://cart-service:8083

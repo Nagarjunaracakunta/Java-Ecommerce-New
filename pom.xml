@@ -20,6 +20,7 @@
         <module>product-service</module>
         <module>auth-service</module>
         <module>api-gateway</module>
+        <module>cart-service</module>
     </modules>
 
     <properties>

@@ -9,14 +9,14 @@ COPY api-gateway/pom.xml     api-gateway/
 COPY cart-service/pom.xml    cart-service/
 
 RUN mvn install -N -q
-RUN mvn dependency:go-offline -pl api-gateway -q
+RUN mvn dependency:go-offline -pl cart-service -q
 
-COPY api-gateway/src api-gateway/src
-RUN mvn package -pl api-gateway -DskipTests -q
+COPY cart-service/src cart-service/src
+RUN mvn package -pl cart-service -DskipTests -q
 
 # Stage 2 — Runtime
 FROM eclipse-temurin:21-jre-jammy
 WORKDIR /app
-COPY --from=builder /workspace/api-gateway/target/*.jar app.jar
-EXPOSE 8080
+COPY --from=builder /workspace/cart-service/target/*.jar app.jar
+EXPOSE 8083
 ENTRYPOINT ["java", "-jar", "app.jar"]

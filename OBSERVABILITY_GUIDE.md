@@ -73,6 +73,7 @@ Spring Boot Service
 | `logger_name` | `com.example.auth.AuthController` | logback |
 | `thread_name` | `http-nio-8080-exec-1` | logback |
 
+docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 ---
 
 ## 3. Start the ELK Stack
@@ -95,12 +96,27 @@ docker compose up -d
 docker compose ps
 ```
 
-Expected output — all three should show `running`:
+> **Note:** The STATUS column shows `running` on Docker Compose v2 and `Up` on Docker Compose v1 — both mean the container is active.
+
+If you see `Up` instead of `running`, use the native Docker command for a consistent view:
+
+```bash
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+```
+
+To include stopped containers too:
+
+```bash
+docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+```
+
+Expected output — all three ELK containers should appear with `Up` or `running`:
 
 ```
-ecommerce-elasticsearch   running   0.0.0.0:9200->9200/tcp
-ecommerce-logstash        running
-ecommerce-kibana          running   0.0.0.0:5601->5601/tcp
+NAMES                      STATUS         PORTS
+ecommerce-elasticsearch    Up 2 minutes   0.0.0.0:9200->9200/tcp
+ecommerce-logstash         Up 2 minutes
+ecommerce-kibana           Up 2 minutes   0.0.0.0:5601->5601/tcp
 ```
 
 ### Watch Logstash start
@@ -162,7 +178,7 @@ yellow  ecommerce-logs-order-service-2026.05.20
 2. If prompted with "Welcome to Kibana" or "Select your space", click **Explore on my own**.
 3. If asked for credentials — this setup has `xpack.security.enabled=false`, so there is no login required.
 4. You are now on the Kibana home screen.
-
+   http://localhost:5601/app/dashboards#/view/dashboard-microservices?_g=(filters:!(),refreshInterval:(pause:!f,value:10000),time:(from:now-24h,to:now))
 **Navigation shortcut**: Click the hamburger menu (☰) at the top-left to open the full menu.
 
 ---

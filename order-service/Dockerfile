@@ -1,5 +1,5 @@
 # Stage 1 — Build
-FROM maven:3.9-eclipse-temurin-21 AS builder
+FROM maven:3.9-eclipse-temurin-21-alpine AS builder
 WORKDIR /workspace
 
 COPY pom.xml .
@@ -18,7 +18,7 @@ COPY order-service/src order-service/src
 RUN mvn package -pl order-service -DskipTests -q
 
 # Stage 2 — Runtime
-FROM eclipse-temurin:21-jre-jammy
+FROM eclipse-temurin:21-jre-alpine
 WORKDIR /app
 COPY --from=builder /workspace/order-service/target/*.jar app.jar
 EXPOSE 8084

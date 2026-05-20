@@ -1,5 +1,5 @@
 # Stage 1 — Build
-FROM maven:3.9-eclipse-temurin-21 AS builder
+FROM maven:3.9-eclipse-temurin-21-alpine AS builder
 WORKDIR /workspace
 
 # Copy all pom files first — Docker caches this layer until a pom changes
@@ -23,7 +23,7 @@ COPY auth-service/src auth-service/src
 RUN mvn package -pl auth-service -DskipTests -q
 
 # Stage 2 — Runtime (JRE only — smaller image)
-FROM eclipse-temurin:21-jre-jammy
+FROM eclipse-temurin:21-jre-alpine
 WORKDIR /app
 COPY --from=builder /workspace/auth-service/target/*.jar app.jar
 EXPOSE 8081

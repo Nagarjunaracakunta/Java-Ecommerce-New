@@ -32,6 +32,7 @@ services:
       - "5433:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d orderdb"]
       interval: 10s
@@ -57,6 +58,12 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9092'"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
     networks:
       - ecommerce-network
 
@@ -68,6 +75,12 @@ services:
       - "27017:27017"
     volumes:
       - mongodb-data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/27017'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks:
       - ecommerce-network
 
@@ -77,6 +90,12 @@ services:
     container_name: ecommerce-redis
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - ecommerce-network
 
@@ -94,6 +113,7 @@ services:
       SPRING_DATASOURCE_PASSWORD: password
       JWT_SECRET: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
       JWT_EXPIRATION_MS: 86400000
+      LOGSTASH_HOST: logstash
     depends_on:
       mysql:
         condition: service_healthy
@@ -114,6 +134,7 @@ services:
       SPRING_DATASOURCE_USERNAME: root
       SPRING_DATASOURCE_PASSWORD: password
       JWT_SECRET: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+      LOGSTASH_HOST: logstash
     depends_on:
       mysql:
         condition: service_healthy
@@ -132,6 +153,7 @@ services:
     environment:
       SPRING_PROFILES_ACTIVE: docker
       JWT_SECRET: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+      LOGSTASH_HOST: logstash
     depends_on:
       - auth-service
       - product-service
@@ -150,9 +172,12 @@ services:
     environment:
       SPRING_PROFILES_ACTIVE: docker
       JWT_SECRET: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+      LOGSTASH_HOST: logstash
     depends_on:
-      - redis
-      - product-service
+      redis:
+        condition: service_healthy
+      product-service:
+        condition: service_started
     restart: on-failure
     networks:
       - ecommerce-network
@@ -168,13 +193,14 @@ services:
     environment:
       SPRING_PROFILES_ACTIVE: docker
       JWT_SECRET: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+      LOGSTASH_HOST: logstash
     depends_on:
       postgres:
         condition: service_healthy
       cart-service:
         condition: service_started
       kafka:
-        condition: service_started
+        condition: service_healthy
     restart: on-failure
     networks:
       - ecommerce-network
@@ -190,11 +216,12 @@ services:
     environment:
       SPRING_PROFILES_ACTIVE: docker
       JWT_SECRET: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
+      LOGSTASH_HOST: logstash
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
-        condition: service_started
+        condition: service_healthy
     restart: on-failure
     networks:
       - ecommerce-network
@@ -212,9 +239,12 @@ services:
       JWT_SECRET: 5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437
       SPRING_MONGODB_URI: mongodb://mongodb:27017/notificationdb
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      LOGSTASH_HOST: logstash
     depends_on:
-      - mongodb
-      - kafka
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
     restart: on-failure
     networks:
       - ecommerce-network
@@ -230,6 +260,61 @@ services:
     depends_on:
       - api-gateway
     restart: on-failure
+    networks:
+      - ecommerce-network
+
+  # ── Elasticsearch ────────────────────────────────────────────────────────────
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    container_name: ecommerce-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms256m -Xmx256m
+      - bootstrap.memory_lock=false
+    mem_limit: 1g
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -v '\"status\":\"red\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - ecommerce-network
+
+  # ── Logstash ──────────────────────────────────────────────────────────────────
+  logstash:
+    image: logstash:8.11.0
+    container_name: ecommerce-logstash
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline
+    mem_limit: 384m
+    environment:
+      - LS_JAVA_OPTS=-Xms128m -Xmx128m
+      - LOGSTASH_INTERNAL_PASSWORD=changeme
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  # ── Kibana ────────────────────────────────────────────────────────────────────
+  kibana:
+    image: kibana:8.11.0
+    container_name: ecommerce-kibana
+    mem_limit: 512m
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - NODE_OPTIONS=--max-old-space-size=350
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
     networks:
       - ecommerce-network
 
@@ -271,6 +356,7 @@ volumes:
   redis-data:
   mysql-data:
   mongodb-data:
+  elasticsearch-data:
   sonarqube_data:
   sonarqube_logs:
   sonarqube_extensions:

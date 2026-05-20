@@ -1,6 +1,6 @@
 
 # Angular Frontend Guide
-# EcommerceHub — Angular 20 · Angular Material · Standalone Components · JWT Auth · Role-Based Guards
+# EcommerceHub — Angular 16 · Angular Material · Standalone Components · JWT Auth · Role-Based Guards
 
 ---
 
@@ -45,7 +45,7 @@
 
 **Angular Concepts Explained**
 28. [Standalone Components vs NgModules](#28-standalone-components-vs-ngmodules)
-29. [Signals — Reactive State Without RxJS](#29-signals--reactive-state-without-rxjs)
+29. [Reactive State — BehaviorSubject and Observables](#29-reactive-state--behaviorsubject-and-observables)
 30. [inject() vs Constructor Injection](#30-inject-vs-constructor-injection)
 31. [Lazy Loading — How and Why](#31-lazy-loading--how-and-why)
 32. [Functional Guards — Modern Angular Pattern](#32-functional-guards--modern-angular-pattern)
@@ -62,16 +62,16 @@
 
 | Tool | Version | Install |
 |---|---|---|
-| Node.js | 18+ (22 used here) | `https://nodejs.org` |
-| npm | 9+ (10.9 used here) | Comes with Node |
-| Angular CLI | 20+ | `npm install -g @angular/cli` |
+| Node.js | 18+ (18 LTS used here) | `https://nodejs.org` |
+| npm | 9+ | Comes with Node |
+| Angular CLI | 16+ | `npm install -g @angular/cli@16` |
 | Java backend | Running on port 8080 | See SERVICES_GUIDE.md |
 
 Verify:
 ```bash
-node --version    # v22.x.x
-npm --version     # 10.x.x
-ng version        # Angular CLI: 20.x.x
+node --version    # v18.x.x
+npm --version     # 9.x.x or 10.x.x
+ng version        # Angular CLI: 16.x.x
 ```
 
 The backend (api-gateway) must be running on `http://localhost:8080` before the frontend can load any data.
@@ -85,11 +85,11 @@ The backend (api-gateway) must be running on `http://localhost:8080` before the 
 ng new ecommerce-frontend \
   --routing=true \       # generates app.routes.ts
   --style=scss \         # SCSS instead of plain CSS
-  --ssr=false \          # no server-side rendering (SPA only)
   --skip-git \           # we use the parent repo's git
-  --skip-tests \         # no spec files generated
-  --standalone           # standalone components (no NgModules)
+  --standalone           # standalone components (no NgModules, available since Angular 14)
 ```
+
+> **Note:** The `--ssr` flag is an Angular 17+ concept. In Angular 16, SSR via Angular Universal is opt-in separately — the default scaffold is a pure SPA without SSR.
 
 ### Step 2 — Add Angular Material
 ```bash
@@ -271,20 +271,23 @@ Each service is a thin wrapper around `HttpClient`. They live in `core/services/
 @Injectable({ providedIn: 'root' })
 export class AuthService {
   private readonly TOKEN_KEY = 'jwt_token';
-  isLoggedIn = signal(this.hasToken());   // Angular signal — reactive state
+
+  constructor(private http: HttpClient, private router: Router) {}
+
+  isLoggedIn(): boolean { return !!localStorage.getItem(this.TOKEN_KEY); }
 
   login(body: LoginRequest) {
     return this.http.post<AuthResponse>(`${environment.apiUrl}/auth/login`, body).pipe(
-      tap(res => {
-        localStorage.setItem(this.TOKEN_KEY, res.token);  // persist token
-        this.isLoggedIn.set(true);                         // update signal → navbar reacts
-      })
+      tap(res => localStorage.setItem(this.TOKEN_KEY, res.token))  // persist token
     );
+  }
+
+  register(body: RegisterRequest) {
+    return this.http.post<void>(`${environment.apiUrl}/auth/register`, body);
   }
 
   logout() {
     localStorage.removeItem(this.TOKEN_KEY);
-    this.isLoggedIn.set(false);
     this.router.navigate(['/login']);
   }
 
@@ -293,13 +296,19 @@ export class AuthService {
   getUsername(): string | null {
     const token = this.getToken();
     if (!token) return null;
-    const payload = JSON.parse(atob(token.split('.')[1]));  // decode JWT payload
-    return payload.sub;                                      // 'sub' = username
+    try {
+      const payload = JSON.parse(atob(token.split('.')[1]));
+      return payload.sub;   // 'sub' = username (set by auth-service)
+    } catch { return null; }
   }
 
   getRole(): string | null {
-    const payload = JSON.parse(atob(this.getToken()!.split('.')[1]));
-    return payload.role;    // 'ROLE_USER' or 'ROLE_ADMIN'
+    const token = this.getToken();
+    if (!token) return null;
+    try {
+      const payload = JSON.parse(atob(token.split('.')[1]));
+      return payload.role;  // 'ROLE_USER' or 'ROLE_ADMIN'
+    } catch { return null; }
   }
 
   isAdmin(): boolean { return this.getRole() === 'ROLE_ADMIN'; }
@@ -308,14 +317,17 @@ export class AuthService {
 
 **Key decisions:**
 - Token stored in `localStorage` — survives page refresh. A production app might prefer `sessionStorage` or `HttpOnly` cookies.
-- `isLoggedIn` is a **signal** — components that read it re-render automatically when it changes (e.g., navbar shows correct links after login without needing an event).
+- `isLoggedIn()` is a **plain method** that reads `localStorage` on every call — simple and reliable in Angular 16. It checks whether a JWT token key exists.
 - `tap()` is an RxJS side-effect operator — it runs the token storage without consuming the Observable chain. The component still receives the `AuthResponse`.
+- try/catch around JWT decoding — handles malformed tokens gracefully without crashing.
 
 ### ProductService
 ```typescript
 @Injectable({ providedIn: 'root' })
 export class ProductService {
   private base = `${environment.apiUrl}/products`;
+
+  constructor(private http: HttpClient) {}
 
   getAll()                              { return this.http.get<Product[]>(this.base); }
   getById(id: number)                   { return this.http.get<Product>(`${this.base}/${id}`); }
@@ -331,6 +343,8 @@ export class ProductService {
 export class CartService {
   private base = `${environment.apiUrl}/cart`;
 
+  constructor(private http: HttpClient) {}
+
   getCart()                    { return this.http.get<CartResponse>(this.base); }
   addItem(item: CartItem)      { return this.http.post<CartResponse>(`${this.base}/items`, item); }
   removeItem(productId: number){ return this.http.delete<CartResponse>(`${this.base}/items/${productId}`); }
@@ -344,6 +358,8 @@ export class CartService {
 export class OrderService {
   private base = `${environment.apiUrl}/orders`;
 
+  constructor(private http: HttpClient) {}
+
   placeOrder(req: PlaceOrderRequest) { return this.http.post<Order>(this.base, req); }
   getMyOrders()                      { return this.http.get<Order[]>(this.base); }
   getById(id: number)                { return this.http.get<Order>(`${this.base}/${id}`); }
@@ -356,14 +372,16 @@ export class OrderService {
 @Injectable({ providedIn: 'root' })
 export class NotificationService {
   private base = `${environment.apiUrl}/notifications`;
-  unreadCount = signal(0);    // signal drives the navbar badge in real-time
+  unreadCount$ = new BehaviorSubject<number>(0);  // reactive state via BehaviorSubject
+
+  constructor(private http: HttpClient) {}
 
   getUnread() { return this.http.get<Notification[]>(this.base); }
   getAll()    { return this.http.get<Notification[]>(`${this.base}/all`); }
 
   getCount() {
     return this.http.get<{ unread: number }>(`${this.base}/count`).pipe(
-      tap(r => this.unreadCount.set(r.unread))   // update signal → navbar badge reacts
+      tap(r => this.unreadCount$.next(r.unread))  // push new value → subscribers react
     );
   }
 
@@ -372,13 +390,13 @@ export class NotificationService {
 }
 ```
 
-**Why `signal(0)` for unreadCount?**
+**Why `BehaviorSubject` for unreadCount?**
 The navbar badge needs to update whenever:
 1. The notifications page loads (calls `getCount()`)
 2. The user marks a notification as read
 3. The app starts (navbar calls `getCount()` on init)
 
-A signal propagates these changes reactively — any template that reads `unreadCount()` re-renders automatically. Without a signal, you'd need an `EventEmitter`, `Subject`, or shared state library.
+`BehaviorSubject` holds the current value and emits it to any new subscriber immediately. Any template subscribing via `| async` re-renders automatically. Components can push new values with `.next(value)` or read the current value with `.getValue()`.
 
 ---
 
@@ -421,14 +439,14 @@ Component calls:
 
 **Why clone?** HttpRequest objects are immutable in Angular. You cannot set headers on an existing request — you must clone it with the new headers. The original request is unchanged; the cloned one carries the token.
 
-**Why `HttpInterceptorFn` (functional)?** Angular 15+ introduced functional interceptors. They don't require a class with `implements HttpInterceptor`. They're registered directly in `provideHttpClient(withInterceptors([jwtInterceptor]))` rather than in a module's providers array.
+**Why `HttpInterceptorFn` (functional)?** Angular 15 introduced functional interceptors. They don't require a class with `implements HttpInterceptor`. They're registered directly in `provideHttpClient(withInterceptors([jwtInterceptor]))` rather than in a module's providers array. Angular 16 supports this pattern fully.
 
 **Registration in `app.config.ts`:**
 ```typescript
 provideHttpClient(withInterceptors([jwtInterceptor]))
 ```
 
-This registers the interceptor globally — every `HttpClient` request in the application goes through it. You don't need to do anything per-component.
+This registers the interceptor globally — every `HttpClient` request in the application goes through it.
 
 ---
 
@@ -439,9 +457,9 @@ This registers the interceptor globally — every `HttpClient` request in the ap
 ```typescript
 export const authGuard: CanActivateFn = () => {
   const auth = inject(AuthService);
-  if (auth.isLoggedIn()) return true;        // signal value — has token in localStorage
-  inject(Router).navigate(['/login']);        // redirect to login
-  return false;                              // block the route
+  if (auth.isLoggedIn()) return true;      // checks localStorage for JWT token
+  inject(Router).navigate(['/login']);     // redirect to login
+  return false;                            // block the route
 };
 ```
 
@@ -449,7 +467,7 @@ Applied to: `/cart`, `/checkout`, `/orders`, `/notifications`
 
 **What happens when a guest visits `/cart`:**
 1. Angular's router checks `canActivate: [authGuard]` before activating the route
-2. `authGuard` calls `auth.isLoggedIn()` — reads the signal, which checks `localStorage`
+2. `authGuard` calls `auth.isLoggedIn()` — checks whether the JWT token exists in `localStorage`
 3. No token → returns `false` and redirects to `/login`
 4. The cart page component is never instantiated — no HTTP call is made
 
@@ -459,7 +477,7 @@ Applied to: `/cart`, `/checkout`, `/orders`, `/notifications`
 export const adminGuard: CanActivateFn = () => {
   const auth = inject(AuthService);
   if (auth.isLoggedIn() && auth.isAdmin()) return true;
-  inject(Router).navigate(['/products']);    // non-admins sent to products page
+  inject(Router).navigate(['/products']);  // non-admins sent to products page
   return false;
 };
 ```
@@ -485,27 +503,33 @@ Guards can return three things:
 
 ```typescript
 // src/app/app.config.ts
+import { ApplicationConfig } from '@angular/core';
+import { provideRouter, withRouterConfig } from '@angular/router';
+import { provideHttpClient, withInterceptors } from '@angular/common/http';
+import { provideAnimations } from '@angular/platform-browser/animations';
+
+import { routes } from './app.routes';
+import { jwtInterceptor } from './core/interceptors/jwt.interceptor';
+
 export const appConfig: ApplicationConfig = {
   providers: [
-    provideBrowserGlobalErrorListeners(),
-    provideZoneChangeDetection({ eventCoalescing: true }),
     provideRouter(routes, withRouterConfig({ onSameUrlNavigation: 'reload' })),
     provideHttpClient(withInterceptors([jwtInterceptor])),
-    provideAnimationsAsync()
+    provideAnimations()
   ]
 };
 ```
 
-This is the Angular 17+ way of bootstrapping an application without `AppModule`. Each `provide*` function registers services into the root DI container.
+This is the Angular 16 way of bootstrapping a standalone application without `AppModule`. Each `provide*` function registers services into the root DI container.
 
 | Provider | What it sets up |
 |---|---|
-| `provideBrowserGlobalErrorListeners()` | Catches unhandled errors and logs them |
-| `provideZoneChangeDetection({ eventCoalescing: true })` | Batches multiple DOM events into a single change detection cycle (performance) |
 | `provideRouter(routes, ...)` | Registers the router with the route table |
 | `withRouterConfig({ onSameUrlNavigation: 'reload' })` | Re-runs the component lifecycle when navigating to the same URL (e.g., clicking "Orders" while already on `/orders`) |
 | `provideHttpClient(withInterceptors([jwtInterceptor]))` | Creates the `HttpClient` singleton and registers the JWT interceptor globally |
-| `provideAnimationsAsync()` | Loads Angular animations lazily — Material components need this for ripple effects, dialogs, etc. |
+| `provideAnimations()` | Loads Angular animations synchronously — Material components need this for ripple effects, dialogs, etc. |
+
+> **Angular 16 vs later versions:** In Angular 17+, `provideAnimationsAsync()` was added for lazy-loading animations, and `provideBrowserGlobalErrorListeners()` / `provideZoneChangeDetection()` were introduced. Angular 16 uses `provideAnimations()` (synchronous) and does not require those additional providers.
 
 ---
 
@@ -609,15 +633,17 @@ The Navbar stays mounted at all times — it's not inside the outlet, it's a sib
 ## 12. Navbar Component
 
 ```typescript
-@Component({ selector: 'app-navbar', standalone: true, ... })
+@Component({ selector: 'app-navbar', standalone: true,
+  imports: [RouterLink, RouterLinkActive, NgIf, AsyncPipe, MatToolbarModule, MatButtonModule,
+            MatIconModule, MatBadgeModule, MatMenuModule], ... })
 export class NavbarComponent implements OnInit {
   auth = inject(AuthService);
   private notifService = inject(NotificationService);
-  unreadCount = this.notifService.unreadCount;   // signal reference
+  unreadCount$ = this.notifService.unreadCount$;  // Observable reference from BehaviorSubject
 
   ngOnInit() {
     if (this.auth.isLoggedIn()) {
-      this.notifService.getCount().subscribe();   // fetch unread count on startup
+      this.notifService.getCount().subscribe();  // fetch unread count on startup
     }
   }
 }
@@ -629,13 +655,13 @@ export class NavbarComponent implements OnInit {
 <ng-container *ngIf="auth.isLoggedIn(); else guestLinks">
   <!-- Logged-in links: Menu, Cart, Orders, Notifications, User menu -->
   <a mat-icon-button routerLink="/notifications"
-     [matBadge]="unreadCount() || null"    <!-- signal call: () reads the value -->
+     [matBadge]="(unreadCount$ | async) || null"    <!-- async pipe subscribes to Observable -->
      matBadgeColor="warn">
     <mat-icon>notifications</mat-icon>
   </a>
 
   <button mat-button [matMenuTriggerFor]="userMenu">
-    {{ auth.getUsername() }}               <!-- shows logged-in username -->
+    <mat-icon>account_circle</mat-icon> {{ auth.getUsername() }}
   </button>
   <mat-menu #userMenu="matMenu">
     <a mat-menu-item routerLink="/admin" *ngIf="auth.isAdmin()">  <!-- admin only -->
@@ -650,8 +676,8 @@ export class NavbarComponent implements OnInit {
 </ng-template>
 ```
 
-**Why `unreadCount() || null` on the badge?**
-`matBadge` hides itself when the value is `null` or `undefined`. When unread count is 0, we pass `null` to hide the badge dot rather than showing "0".
+**Why `(unreadCount$ | async) || null` on the badge?**
+`matBadge` hides itself when the value is `null` or `undefined`. When unread count is 0, we pass `null` to hide the badge dot rather than showing "0". The `async` pipe subscribes to the `BehaviorSubject` Observable and automatically unsubscribes when the component is destroyed.
 
 **`routerLinkActive="active-link"`** — Angular adds the CSS class `active-link` to the link that matches the current URL. The style `.active-link { background: rgba(255,255,255,0.15) }` gives a subtle highlight to the active nav item.
 
@@ -705,7 +731,6 @@ submit() called
             ▼ HTTP POST /auth/login
             │
     ├── Success → localStorage.setItem('jwt_token', token)
-    │             isLoggedIn signal set to true
     │             router.navigate(['/products'])
     └── Error  → MatSnackBar shows error message
                  loading = false (re-enables button)
@@ -721,7 +746,7 @@ private fb = inject(FormBuilder);   // runs during field initialization
 form = this.fb.group({ ... });       // fb is now available
 ```
 
-This is also the Angular 17+ recommended style for service injection.
+This is the recommended pattern in Angular 14+ when you need an injected value to initialize another class field.
 
 ---
 
@@ -982,24 +1007,30 @@ Dynamic class binding: `'status-' + order.status.toLowerCase()` produces `status
 ```typescript
 export class NotificationsComponent implements OnInit {
   notifications: Notification[] = [];
+  loading = true;
   hasUnread = false;
+
+  constructor(private notifService: NotificationService, private snack: MatSnackBar) {}
 
   ngOnInit() {
     this.notifService.getAll().subscribe({
       next: n => {
         this.notifications = n;
         this.hasUnread = n.some(x => !x.read);
+        this.loading = false;
         this.notifService.getCount().subscribe();  // sync navbar badge
-      }
+      },
+      error: () => { this.loading = false; }
     });
   }
 
   markRead(n: Notification) {
     this.notifService.markRead(n.id).subscribe({
       next: () => {
-        n.read = true;                                           // update in-place
-        this.hasUnread = this.notifications.some(x => !x.read); // recompute
-        this.notifService.unreadCount.update(c => Math.max(0, c - 1));  // decrement signal
+        n.read = true;                                                            // update in-place
+        this.hasUnread = this.notifications.some(x => !x.read);                  // recompute
+        const current = this.notifService.unreadCount$.getValue();               // read current value
+        this.notifService.unreadCount$.next(Math.max(0, current - 1));           // push decremented value
       }
     });
   }
@@ -1009,15 +1040,16 @@ export class NotificationsComponent implements OnInit {
       next: () => {
         this.notifications.forEach(n => n.read = true);
         this.hasUnread = false;
-        this.notifService.unreadCount.set(0);  // zero signal → badge disappears
+        this.notifService.unreadCount$.next(0);  // zero → badge disappears in navbar
+        this.snack.open('All notifications marked as read', 'Close', { duration: 2000 });
       }
     });
   }
 }
 ```
 
-**Signal update after mark-read:**
-`this.notifService.unreadCount.update(c => Math.max(0, c - 1))` uses the `update()` form of a signal — it receives the current value and returns the new value. The navbar's badge reads this signal and re-renders immediately.
+**BehaviorSubject update after mark-read:**
+`this.notifService.unreadCount$.next(Math.max(0, current - 1))` pushes a new value into the `BehaviorSubject`. The navbar's badge subscribes via `unreadCount$ | async` and re-renders immediately with the new count.
 
 **Unread styling:**
 ```html
@@ -1114,7 +1146,7 @@ Clicking the edit icon on the product list navigates to `/admin?edit=1`, which p
 │  │  authGuard   │  │  adminGuard                          │   │
 │  │  checks:     │  │  checks:                             │   │
 │  │  isLoggedIn()│  │  isLoggedIn() && isAdmin()           │   │
-│  │  (signal)    │  │  (reads JWT payload.role)            │   │
+│  │  (localStorage)  │  (reads JWT payload.role)           │   │
 │  └──────────────┘  └──────────────────────────────────────┘   │
 │                                                                 │
 │  JWT Interceptor (on every HTTP call)                           │
@@ -1178,14 +1210,20 @@ eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiJ0ZXN0dXNlciIsInJvbGUiOiJST0xFX0FETUlOIiwiaWF0Ijo
 getUsername(): string | null {
   const token = this.getToken();
   if (!token) return null;
-  // Split by '.' → take index 1 (payload) → base64 decode → parse JSON
-  const payload = JSON.parse(atob(token.split('.')[1]));
-  return payload.sub;   // 'sub' = subject = username (set by auth-service)
+  try {
+    // Split by '.' → take index 1 (payload) → base64 decode → parse JSON
+    const payload = JSON.parse(atob(token.split('.')[1]));
+    return payload.sub;   // 'sub' = subject = username (set by auth-service)
+  } catch { return null; }
 }
 
 getRole(): string | null {
-  const payload = JSON.parse(atob(this.getToken()!.split('.')[1]));
-  return payload.role;  // 'ROLE_USER' or 'ROLE_ADMIN'
+  const token = this.getToken();
+  if (!token) return null;
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1]));
+    return payload.role;  // 'ROLE_USER' or 'ROLE_ADMIN'
+  } catch { return null; }
 }
 ```
 
@@ -1324,7 +1362,7 @@ The backend returns `403 Forbidden`.
    { path: 'cart', canActivate: [authGuard] }
 
 3. authGuard runs:
-   auth.isLoggedIn() → signal reads localStorage → no token → false
+   auth.isLoggedIn() → checks localStorage → no token → false
    router.navigate(['/login'])
    returns false
 
@@ -1392,7 +1430,7 @@ Angular receives error → snack.open('Save failed')
 
 ## 28. Standalone Components vs NgModules
 
-**Old way (NgModules — Angular 1–16):**
+**Old way (NgModules — Angular 1–13, required; Angular 14–15, optional):**
 ```typescript
 @NgModule({
   declarations: [ProductListComponent],
@@ -1404,7 +1442,7 @@ export class ProductModule {}
 
 Each component had to be declared in a module. Modules were shared between components. You'd get "Component not declared in any module" errors.
 
-**New way (Standalone — Angular 17+):**
+**New way (Standalone — introduced in Angular 14, stable in Angular 15+):**
 ```typescript
 @Component({
   selector: 'app-product-list',
@@ -1420,87 +1458,116 @@ Each component is self-contained. No modules to manage. Benefits:
 - Less boilerplate — no `declarations` array to maintain
 - `inject()` works anywhere inside the component class
 
-All components in this project use `standalone: true`.
+All components in this project use `standalone: true`. This project uses Angular 16 which fully supports standalone components.
 
 ---
 
-## 29. Signals — Reactive State Without RxJS
+## 29. Reactive State — BehaviorSubject and Observables
 
-Angular 17 introduced **Signals** — a primitive for reactive state that's simpler than RxJS Observables for local state management.
+Angular 16 uses RxJS **BehaviorSubject** for shared reactive state. This is the recommended pattern for state that must be shared between services and components (e.g., the unread notification count shared between `NotificationService` and `NavbarComponent`).
 
-**Creating a signal:**
+**Creating a BehaviorSubject:**
 ```typescript
-import { signal } from '@angular/core';
-unreadCount = signal(0);     // initial value = 0
-isLoggedIn  = signal(false);
+import { BehaviorSubject } from 'rxjs';
+
+// In NotificationService:
+unreadCount$ = new BehaviorSubject<number>(0);  // initial value = 0
 ```
 
-**Reading a signal (in TypeScript):**
+**Pushing a new value:**
 ```typescript
-console.log(this.unreadCount());   // call like a function
+this.unreadCount$.next(5);                          // replace value
+this.unreadCount$.next(Math.max(0, current - 1));   // derive from current value
+this.unreadCount$.next(0);                          // reset to zero
 ```
 
-**Reading a signal (in templates):**
+**Reading the current value (imperative):**
+```typescript
+const current = this.notifService.unreadCount$.getValue();
+```
+
+**Reading reactively (in templates via async pipe):**
 ```html
-<span>{{ unreadCount() }}</span>
-[matBadge]="unreadCount() || null"
+<!-- NavbarComponent template -->
+[matBadge]="(unreadCount$ | async) || null"
 ```
 
-**Writing to a signal:**
+The `async` pipe:
+- Subscribes to the Observable/BehaviorSubject automatically
+- Triggers change detection when a new value is emitted
+- Unsubscribes automatically when the component is destroyed (prevents memory leaks)
+
+**Complete pattern used in this project:**
 ```typescript
-this.unreadCount.set(5);                           // replace value
-this.unreadCount.update(c => c - 1);              // compute new value from old
+// NotificationService — holds state
+unreadCount$ = new BehaviorSubject<number>(0);
+getCount() {
+  return this.http.get<{ unread: number }>(`${this.base}/count`).pipe(
+    tap(r => this.unreadCount$.next(r.unread))  // update state when API responds
+  );
+}
+
+// NavbarComponent — reads state reactively
+unreadCount$ = this.notifService.unreadCount$;  // hold reference to Observable
+// template: [matBadge]="(unreadCount$ | async) || null"
+
+// NotificationsComponent — updates state imperatively
+markRead(n: Notification) {
+  this.notifService.markRead(n.id).subscribe({
+    next: () => {
+      const current = this.notifService.unreadCount$.getValue();
+      this.notifService.unreadCount$.next(Math.max(0, current - 1));  // decrement
+    }
+  });
+}
 ```
 
-**Why signals instead of a Subject/BehaviorSubject?**
-
-BehaviorSubject approach (more verbose):
-```typescript
-private unreadCountSubject = new BehaviorSubject<number>(0);
-unreadCount$ = this.unreadCountSubject.asObservable();
-// template: {{ unreadCount$ | async }}
-// update: this.unreadCountSubject.next(5)
-```
-
-Signal approach:
-```typescript
-unreadCount = signal(0);
-// template: {{ unreadCount() }}
-// update: this.unreadCount.set(5)
-```
-
-Signals are synchronous, simpler, and have better integration with Angular's change detection. They're the recommended way to manage local reactive state in Angular 17+.
+> **Angular 17+ note:** Angular 17 introduced **Signals** (`signal()`, `.set()`, `.update()`) as a simpler alternative for reactive state. Signals are not used in this Angular 16 project — BehaviorSubject is the standard approach here.
 
 ---
 
 ## 30. inject() vs Constructor Injection
 
-**Constructor injection (traditional):**
-```typescript
-export class MyComponent {
-  form = this.fb.group({ ... });  // ❌ ERROR: fb used before initialization
+Both patterns are supported in Angular 16. Each has a specific use case.
 
-  constructor(private fb: FormBuilder) {}
+**Constructor injection (used in services like AuthService, NotificationService):**
+```typescript
+@Injectable({ providedIn: 'root' })
+export class AuthService {
+  constructor(private http: HttpClient, private router: Router) {}
+
+  isLoggedIn(): boolean { return !!localStorage.getItem('jwt_token'); }
 }
 ```
 
-TypeScript class field initializers run before the constructor body. When `form = this.fb.group(...)` executes, `this.fb` hasn't been assigned yet by the constructor.
+This is the traditional Angular DI pattern. It's perfectly valid and readable for services where you don't need the injected values to initialize other class fields.
 
-**inject() (Angular 14+):**
+**inject() (Angular 14+ — used in components with class field initialization):**
 ```typescript
-export class MyComponent {
+export class LoginComponent {
   private fb = inject(FormBuilder);   // ✅ runs during field initialization
-  form = this.fb.group({ ... });       // fb is available
+  form = this.fb.group({ ... });       // fb is available here
+
+  // ❌ BROKEN with constructor injection:
+  // constructor(private fb: FormBuilder) {}
+  // form = this.fb.group({ ... });  // ERROR: fb is undefined at this point
 }
 ```
 
-`inject()` resolves the dependency from the current DI context at the time the class field is initialized. It can be called anywhere in a constructor context — class fields, the constructor body, or functions called from there.
+TypeScript class field initializers run **before** the constructor body. When `form = this.fb.group(...)` executes, constructor injection hasn't assigned `this.fb` yet — you get a "used before initialization" runtime error.
+
+`inject()` resolves the dependency from the DI context at field-initialization time, making it available immediately.
+
+**In this project:**
+- `inject()` is used in: component classes that initialize class fields with injected values (Login, Checkout, Admin), functional guards, functional interceptors
+- Constructor injection is used in: services (AuthService, NotificationService, ProductService, etc.), components that only need services in methods
 
 **When to use each:**
-- Use `inject()` when you need the injected value to initialize another class field
-- Use constructor injection when you just need dependencies available in methods
-
-In this project, `inject()` is used throughout because it's cleaner and solves the initialization order issue.
+| Situation | Pattern |
+|---|---|
+| Need injected value to initialize a class field | `inject()` |
+| Services where DI is only used in methods | Constructor injection |
+| Functional guards / interceptors | `inject()` only (no constructor available) |
 
 ---
 
@@ -1536,7 +1603,7 @@ A regular user never visits `/admin`, so they never download 30 kB of admin code
 
 ## 32. Functional Guards — Modern Angular Pattern
 
-Traditional class-based guard:
+Traditional class-based guard (pre-Angular 15):
 ```typescript
 @Injectable({ providedIn: 'root' })
 export class AuthGuard implements CanActivate {
@@ -1550,7 +1617,7 @@ export class AuthGuard implements CanActivate {
 }
 ```
 
-Functional guard (Angular 15+):
+Functional guard (Angular 15+ — used in this project):
 ```typescript
 export const authGuard: CanActivateFn = () => {
   const auth = inject(AuthService);
@@ -1560,7 +1627,7 @@ export const authGuard: CanActivateFn = () => {
 };
 ```
 
-No class, no `@Injectable`, no constructor. `inject()` works inside functional guards because the Angular DI context is active when the guard runs. Benefits:
+No class, no `@Injectable`, no constructor. `inject()` works inside functional guards because the Angular DI context is active when the guard runs. Angular 16 fully supports this pattern. Benefits:
 - Less boilerplate
 - Easier to test (just a function)
 - Can be composed: `canActivate: [authGuard, someOtherGuard]`
@@ -1569,7 +1636,7 @@ No class, no `@Injectable`, no constructor. `inject()` works inside functional g
 
 ## 33. Functional Interceptors — Modern Angular Pattern
 
-Traditional class-based interceptor:
+Traditional class-based interceptor (pre-Angular 15):
 ```typescript
 @Injectable()
 export class JwtInterceptor implements HttpInterceptor {
@@ -1586,7 +1653,7 @@ export class JwtInterceptor implements HttpInterceptor {
 // Must also be added to providers with HTTP_INTERCEPTORS token
 ```
 
-Functional interceptor (Angular 15+):
+Functional interceptor (Angular 15+ — used in this project):
 ```typescript
 export const jwtInterceptor: HttpInterceptorFn = (req, next) => {
   const token = inject(AuthService).getToken();
@@ -1599,7 +1666,7 @@ export const jwtInterceptor: HttpInterceptorFn = (req, next) => {
 provideHttpClient(withInterceptors([jwtInterceptor]))
 ```
 
-Functional interceptors are registered in `provideHttpClient()` directly — no separate providers array entry needed.
+Functional interceptors are registered in `provideHttpClient()` directly — no separate providers array entry needed. Angular 16 supports this pattern fully.
 
 ---
 
@@ -1625,10 +1692,12 @@ ng serve --port 4200
 ### Build for production
 ```bash
 ng build --configuration=production
-# Output: dist/ecommerce-frontend/browser/
+# Output: dist/ecommerce-frontend/
 # Serve with any static file server: nginx, Apache, serve, etc.
-npx serve dist/ecommerce-frontend/browser
+npx serve dist/ecommerce-frontend
 ```
+
+> **Angular 16 build output:** The production build outputs to `dist/ecommerce-frontend/` (no `/browser/` subfolder — that was introduced in Angular 17+). The Dockerfile copies from `/app/dist/ecommerce-frontend` to nginx's html root.
 
 ### Route summary
 
@@ -1785,19 +1854,25 @@ form = this.fb.group({ ... });
 
 ### Navbar doesn't update after login/logout
 
-**Cause:** The navbar reads `auth.isLoggedIn()` once at component creation instead of reactively.
+**Cause:** The `isLoggedIn()` method returns a snapshot of localStorage at call time. In Angular 16, since we're not using signals, the navbar template re-evaluates on each change detection cycle — navigating to a new page triggers change detection, which re-reads `isLoggedIn()`.
 
-**Fix:** `isLoggedIn` is a signal in `AuthService`. The template calls `auth.isLoggedIn()` — the parentheses make it a signal read, which Angular tracks for reactivity. On login, `this.isLoggedIn.set(true)` triggers re-render of any template that called `isLoggedIn()`.
+**If the navbar appears stuck:** Ensure `auth.logout()` calls `router.navigate(['/login'])` so Angular triggers a navigation (and change detection). The method in `AuthService` does this:
+```typescript
+logout() {
+  localStorage.removeItem(this.TOKEN_KEY);
+  this.router.navigate(['/login']);   // navigation triggers change detection
+}
+```
 
 ---
 
 ### Badge shows 0 instead of disappearing
 
-**Cause:** `[matBadge]="unreadCount()"` passes `0` to the badge, which displays "0".
+**Cause:** `[matBadge]="(unreadCount$ | async)"` passes `0` to the badge, which displays "0".
 
 **Fix:** Pass `null` to hide the badge when count is zero:
 ```html
-[matBadge]="unreadCount() || null"
+[matBadge]="(unreadCount$ | async) || null"
 ```
 `0 || null` evaluates to `null`. Material's badge hides when value is null/undefined.
 
@@ -1827,3 +1902,15 @@ docker compose up -d api-gateway
 **Cause:** Your account has `ROLE_USER`, not `ROLE_ADMIN`. The `adminGuard` checks `isAdmin()` → `getRole() === 'ROLE_ADMIN'`.
 
 **Fix:** Use an account registered with the admin role. Check your token in the browser DevTools → Application → Local Storage → `jwt_token`, then decode it at `jwt.io` to verify the role claim.
+
+---
+
+### `npm install` fails with peer dependency errors
+
+**Cause:** Angular 16 dependencies can have strict peer version requirements.
+
+**Fix:** Use `--legacy-peer-deps` flag:
+```bash
+npm install --legacy-peer-deps
+```
+This is also used in the Dockerfile during the Docker build (`npm ci --legacy-peer-deps`).

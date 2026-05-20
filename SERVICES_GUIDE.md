@@ -1,5 +1,5 @@
 # Java Ecommerce — Services Guide
-# api-gateway · auth-service · product-service · cart-service · order-service · payment-service · notification-service · JWT · Kafka · Redis · MongoDB
+# api-gateway · auth-service · product-service · cart-service · order-service · payment-service · notification-service · JWT · Kafka · Redis · MongoDB · SLF4J/Logstash
 
 ---
 
@@ -7,6 +7,7 @@
 
 **Multi-Module**
 1. [Multi-Module Project Structure](#1-multi-module-project-structure)
+1a. [SLF4J Structured Logging — Logstash Integration](#1a-slf4j-structured-logging--logstash-integration)
 
 **api-gateway**
 2. [api-gateway — Overview and Design](#2-api-gateway--overview-and-design)
@@ -98,26 +99,36 @@
 The root project is a Maven aggregator that owns all child modules.
 
 ```
-Java-Ecommerce-New/           ← root aggregator (pom packaging)
-├── pom.xml                   ← parent pom — shared plugins, properties
-├── api-gateway/              ← child module (port 8080) — entry point
+Java-Ecommerce-New/                ← root aggregator (pom packaging)
+├── pom.xml                        ← parent pom — shared plugins, properties
+├── api-gateway/                   ← child module (port 8080) — entry point
 │   └── pom.xml
-├── auth-service/             ← child module (port 8081)
+├── auth-service/                  ← child module (port 8081)
 │   └── pom.xml
-└── product-service/          ← child module (port 8082)
+├── product-service/               ← child module (port 8082)
+│   └── pom.xml
+├── cart-service/                  ← child module (port 8083) — Redis
+│   └── pom.xml
+├── order-service/                 ← child module (port 8084) — PostgreSQL + Kafka
+│   └── pom.xml
+├── payment-service/               ← child module (port 8085) — PostgreSQL + Kafka
+│   └── pom.xml
+└── notification-service/          ← child module (port 8087) — MongoDB + Kafka
     └── pom.xml
 ```
 
 ### Full architecture (startup order)
 ```
-auth-service        (port 8081) — user login, JWT issue
-product-service     (port 8082) — product CRUD
-api-gateway         (port 8080) — routing, JWT validation, rate limiting  ← BUILT
-cart-service        (port 8083)
-order-service       (port 8084)
-payment-service     (port 8085)
-inventory-service   (port 8086)
-notification-service(port 8087)
+MySQL / PostgreSQL / Redis / MongoDB / Kafka   ← infrastructure (Docker)
+        │
+auth-service        (port 8081) — user login, JWT issue (MySQL)
+product-service     (port 8082) — product CRUD (MySQL)
+api-gateway         (port 8080) — routing, JWT validation, rate limiting
+cart-service        (port 8083) — Redis-backed cart + service-to-service auth
+order-service       (port 8084) — order lifecycle, Kafka consumer (PostgreSQL)
+payment-service     (port 8085) — payment processing, Kafka producer (PostgreSQL)
+notification-service(port 8087) — Kafka consumer, MongoDB persistence
+ecommerce-frontend  (port 4200) — Angular 16 SPA served by nginx
 ```
 
 ### Root pom.xml — module declaration
@@ -127,6 +138,10 @@ notification-service(port 8087)
     <module>api-gateway</module>
     <module>auth-service</module>
     <module>product-service</module>
+    <module>cart-service</module>
+    <module>order-service</module>
+    <module>payment-service</module>
+    <module>notification-service</module>
 </modules>
 ```
 
@@ -143,6 +158,118 @@ mvn clean package
 # Build only one module
 cd product-service && mvn clean package
 ```
+
+---
+
+## 1a. SLF4J Structured Logging — Logstash Integration
+
+All microservices send structured JSON logs to Logstash over TCP using the `logstash-logback-encoder` library. Logs flow: **service → Logstash:5000 → Elasticsearch → Kibana**.
+
+### Maven dependency (each service pom.xml)
+```xml
+<dependency>
+    <groupId>net.logstash.logback</groupId>
+    <artifactId>logstash-logback-encoder</artifactId>
+    <version>7.4</version>
+</dependency>
+```
+
+### logback-spring.xml (each service)
+
+Each service has `src/main/resources/logback-spring.xml`:
+
+```xml
+<configuration>
+    <!-- Read spring.application.name and logstash.host from properties/env -->
+    <springProperty scope="context" name="APP_NAME" source="spring.application.name"/>
+    <springProperty scope="context" name="LOGSTASH_HOST" source="logstash.host" defaultValue="localhost"/>
+
+    <!-- Console — structured pattern for local dev -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Logstash — ships JSON over TCP; retries on disconnect -->
+    <appender name="LOGSTASH" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
+        <destination>${LOGSTASH_HOST}:5000</destination>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <customFields>{"service_name":"${APP_NAME}"}</customFields>
+        </encoder>
+        <reconnectionDelay>5 seconds</reconnectionDelay>
+        <keepAliveDuration>5 minutes</keepAliveDuration>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="LOGSTASH"/>
+    </root>
+</configuration>
+```
+
+### How LOGSTASH_HOST is resolved
+
+| Environment | Value | How set |
+|---|---|---|
+| Local dev | `localhost` | `defaultValue` in `logback-spring.xml` |
+| Docker | `logstash` | `LOGSTASH_HOST: logstash` in `docker-compose.yml` |
+
+Each service's `docker-compose.yml` entry includes:
+```yaml
+environment:
+  LOGSTASH_HOST: logstash
+```
+
+Spring Boot reads `LOGSTASH_HOST` as the `logstash.host` property (env vars map to properties automatically), and `logback-spring.xml` picks it up via `<springProperty>`.
+
+### What each log entry looks like in Elasticsearch
+
+```json
+{
+  "@timestamp": "2026-05-20T10:23:45.123Z",
+  "service_name": "auth-service",
+  "level": "INFO",
+  "logger_name": "com.fooddelivery.auth.service.AuthService",
+  "message": "User alice logged in successfully",
+  "thread_name": "http-nio-8081-exec-3"
+}
+```
+
+### Logstash pipeline
+
+`logstash/pipeline/logstash.conf` receives TCP JSON from all services and routes them into per-service daily Elasticsearch indices:
+
+```
+Input:  TCP:5000 (JSON lines)
+Output: ecommerce-logs-{service_name}-{YYYY.MM.dd}
+        e.g. ecommerce-logs-auth-service-2026.05.20
+             ecommerce-logs-order-service-2026.05.20
+```
+
+See **OBSERVABILITY_GUIDE.md** for Kibana dashboard setup and log query examples.
+
+### Logging in service code
+
+Use the standard SLF4J API — no Logstash-specific code needed in business logic:
+
+```java
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class AuthService {
+    private static final Logger log = LoggerFactory.getLogger(AuthService.class);
+
+    public LoginResponse login(LoginRequest request) {
+        log.info("Login attempt for user: {}", request.username());
+        // ...
+        log.warn("Failed login attempt for user: {}", request.username());
+        log.error("Unexpected error during login", exception);
+    }
+}
+```
+
+The `LogstashTcpSocketAppender` handles the transport transparently — all `log.info()`/`log.warn()`/`log.error()` calls go to both console and Logstash automatically.
 
 ---
 
@@ -226,10 +353,25 @@ Spring Cloud 2025.x compiled against different Spring Boot 4.x internal classes 
 Routes live in `application.yml` and are bound to `RouteProperties` via `@ConfigurationProperties`:
 
 ```yaml
+# application.yml (local dev)
 gateway:
   routes:
-    "[/auth]": http://localhost:8081
-    "[/products]": http://localhost:8082
+    "[/auth]":          http://localhost:8081
+    "[/products]":      http://localhost:8082
+    "[/cart]":          http://localhost:8083
+    "[/orders]":        http://localhost:8084
+    "[/payments]":      http://localhost:8085
+    "[/notifications]": http://localhost:8087
+
+# application-docker.yml (Docker — container hostnames)
+gateway:
+  routes:
+    "[/auth]":          http://auth-service:8081
+    "[/products]":      http://product-service:8082
+    "[/cart]":          http://cart-service:8083
+    "[/orders]":        http://order-service:8084
+    "[/payments]":      http://payment-service:8085
+    "[/notifications]": http://notification-service:8087
 ```
 
 **Why bracket notation `"[/auth]"`?**
@@ -247,7 +389,7 @@ public class RouteProperties {
 
 To add a new service, add one line to `application.yml` — no code change needed:
 ```yaml
-"[/orders]": http://localhost:8084
+"[/inventory]": http://localhost:8086
 ```
 
 ---
@@ -325,8 +467,12 @@ The client sends `Host: localhost:8080` (the gateway). If forwarded as-is, some 
 ```yaml
 gateway:
   routes:
-    "[/auth]": http://localhost:8081
-    "[/products]": http://localhost:8082
+    "[/auth]":          http://localhost:8081
+    "[/products]":      http://localhost:8082
+    "[/cart]":          http://localhost:8083
+    "[/orders]":        http://localhost:8084
+    "[/payments]":      http://localhost:8085
+    "[/notifications]": http://localhost:8087
 ```
 
 **Design decisions:**

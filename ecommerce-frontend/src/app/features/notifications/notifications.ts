@@ -40,11 +40,11 @@ import { Notification } from '../../core/models';
                 <mat-icon [class]="n.type === 'ORDER_CONFIRMED' ? 'icon-success' : 'icon-error'">
                   {{ n.type === 'ORDER_CONFIRMED' ? 'check_circle' : 'cancel' }}
                 </mat-icon>
-                <mat-chip-list>
+                <mat-chip-set>
                   <mat-chip [class]="n.type === 'ORDER_CONFIRMED' ? 'chip-success' : 'chip-error'">
                     {{ n.type === 'ORDER_CONFIRMED' ? 'Confirmed' : 'Cancelled' }}
                   </mat-chip>
-                </mat-chip-list>
+                </mat-chip-set>
               </div>
               <div class="notif-meta">
                 <span class="notif-time">{{ n.createdAt | date:'MMM d, h:mm a' }}</span>

@@ -37,9 +37,9 @@ import { Product } from '../../../core/models';
           <mat-card-header>
             <mat-card-title>{{ p.name }}</mat-card-title>
             <mat-card-subtitle>
-              <mat-chip-list>
+              <mat-chip-set>
                 <mat-chip>{{ p.category }}</mat-chip>
-              </mat-chip-list>
+              </mat-chip-set>
             </mat-card-subtitle>
           </mat-card-header>
           <mat-card-content>

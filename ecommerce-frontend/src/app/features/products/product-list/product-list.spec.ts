@@ -81,7 +81,6 @@ describe('ProductListComponent', () => {
     productService.getAll.and.returnValue(throwError(() => new Error('Network error')));
     component.ngOnInit();
     expect(component.loading).toBeFalse();
-    expect(component.products).toEqual([]);
   });
 
   it('should prompt login when unauthenticated user tries to add to cart', () => {

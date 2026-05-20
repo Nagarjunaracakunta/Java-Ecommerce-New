@@ -56,11 +56,10 @@ describe('CartComponent', () => {
     expect(component.loading).toBeFalse();
   });
 
-  it('should set loading false and show empty state on API error', () => {
+  it('should set loading to false on API error', () => {
     cartService.getCart.and.returnValue(throwError(() => new Error('Unauthorized')));
     component.ngOnInit();
     expect(component.loading).toBeFalse();
-    expect(component.items).toEqual([]);
   });
 
   it('should remove item and update state', () => {

@@ -3,6 +3,7 @@ import { RouterTestingModule } from '@angular/router/testing';
 import { NoopAnimationsModule } from '@angular/platform-browser/animations';
 import { MatSnackBarModule } from '@angular/material/snack-bar';
 import { of, throwError } from 'rxjs';
+import { Router } from '@angular/router';
 import { LoginComponent } from './login';
 import { AuthService } from '../../../core/services/auth.service';
 
@@ -21,6 +22,7 @@ describe('LoginComponent', () => {
 
     fixture = TestBed.createComponent(LoginComponent);
     component = fixture.componentInstance;
+    spyOn(TestBed.inject(Router), 'navigate');
     fixture.detectChanges();
   });
 

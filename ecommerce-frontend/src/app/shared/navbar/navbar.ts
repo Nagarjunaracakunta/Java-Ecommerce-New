@@ -5,14 +5,14 @@ import { MatButtonModule } from '@angular/material/button';
 import { MatIconModule } from '@angular/material/icon';
 import { MatBadgeModule } from '@angular/material/badge';
 import { MatMenuModule } from '@angular/material/menu';
-import { NgIf } from '@angular/common';
+import { NgIf, AsyncPipe } from '@angular/common';
 import { AuthService } from '../../core/services/auth.service';
 import { NotificationService } from '../../core/services/notification.service';
 
 @Component({
   selector: 'app-navbar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive, NgIf, MatToolbarModule, MatButtonModule,
+  imports: [RouterLink, RouterLinkActive, NgIf, AsyncPipe, MatToolbarModule, MatButtonModule,
             MatIconModule, MatBadgeModule, MatMenuModule],
   template: `
     <mat-toolbar color="primary" class="navbar">
@@ -34,7 +34,7 @@ import { NotificationService } from '../../core/services/notification.service';
           <mat-icon>receipt_long</mat-icon> Orders
         </a>
         <a mat-icon-button routerLink="/notifications" routerLinkActive="active-link"
-           [matBadge]="unreadCount() || null" matBadgeColor="warn"
+           [matBadge]="(unreadCount$ | async) || null" matBadgeColor="warn"
            matBadgeSize="small">
           <mat-icon>notifications</mat-icon>
         </a>
@@ -73,7 +73,7 @@ import { NotificationService } from '../../core/services/notification.service';
 export class NavbarComponent implements OnInit {
   auth = inject(AuthService);
   private notifService = inject(NotificationService);
-  unreadCount = this.notifService.unreadCount;
+  unreadCount$ = this.notifService.unreadCount$;
 
   ngOnInit() {
     if (this.auth.isLoggedIn()) {

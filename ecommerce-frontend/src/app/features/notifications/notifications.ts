@@ -40,13 +40,15 @@ import { Notification } from '../../core/models';
                 <mat-icon [class]="n.type === 'ORDER_CONFIRMED' ? 'icon-success' : 'icon-error'">
                   {{ n.type === 'ORDER_CONFIRMED' ? 'check_circle' : 'cancel' }}
                 </mat-icon>
-                <mat-chip [class]="n.type === 'ORDER_CONFIRMED' ? 'chip-success' : 'chip-error'">
-                  {{ n.type === 'ORDER_CONFIRMED' ? 'Confirmed' : 'Cancelled' }}
-                </mat-chip>
+                <mat-chip-list>
+                  <mat-chip [class]="n.type === 'ORDER_CONFIRMED' ? 'chip-success' : 'chip-error'">
+                    {{ n.type === 'ORDER_CONFIRMED' ? 'Confirmed' : 'Cancelled' }}
+                  </mat-chip>
+                </mat-chip-list>
               </div>
               <div class="notif-meta">
                 <span class="notif-time">{{ n.createdAt | date:'MMM d, h:mm a' }}</span>
-                <button mat-icon-button *ngIf="!n.read" (click)="markRead(n)" matTooltip="Mark as read">
+                <button mat-icon-button *ngIf="!n.read" (click)="markRead(n)">
                   <mat-icon>mark_email_read</mat-icon>
                 </button>
               </div>
@@ -107,7 +109,8 @@ export class NotificationsComponent implements OnInit {
       next: () => {
         n.read = true;
         this.hasUnread = this.notifications.some(x => !x.read);
-        this.notifService.unreadCount.update(c => Math.max(0, c - 1));
+        const current = this.notifService.unreadCount$.getValue();
+        this.notifService.unreadCount$.next(Math.max(0, current - 1));
       }
     });
   }
@@ -117,7 +120,7 @@ export class NotificationsComponent implements OnInit {
       next: () => {
         this.notifications.forEach(n => n.read = true);
         this.hasUnread = false;
-        this.notifService.unreadCount.set(0);
+        this.notifService.unreadCount$.next(0);
         this.snack.open('All notifications marked as read', 'Close', { duration: 2000 });
       }
     });

@@ -27,7 +27,7 @@ import { Product } from '../../../core/models';
         <mat-card-header>
           <mat-card-title>{{ product.name }}</mat-card-title>
           <mat-card-subtitle>
-            <mat-chip-set><mat-chip>{{ product.category }}</mat-chip></mat-chip-set>
+            <mat-chip-list><mat-chip>{{ product.category }}</mat-chip></mat-chip-list>
           </mat-card-subtitle>
         </mat-card-header>
         <mat-card-content>

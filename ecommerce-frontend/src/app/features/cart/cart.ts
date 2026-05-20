@@ -7,7 +7,7 @@ import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { MatDividerModule } from '@angular/material/divider';
 import { MatTableModule } from '@angular/material/table';
-import { NgFor, NgIf, CurrencyPipe } from '@angular/common';
+import { NgIf, CurrencyPipe } from '@angular/common';
 import { CartService } from '../../core/services/cart.service';
 import { CartItemResponse } from '../../core/models';
 
@@ -100,14 +100,18 @@ export class CartComponent implements OnInit {
   loadCart() {
     this.loading = true;
     this.cartService.getCart().subscribe({
-      next: c => { this.items = c.items; this.total = c.total; this.loading = false; },
+      next: c => {
+        this.items = c?.items ?? [];
+        this.total = c?.total ?? 0;
+        this.loading = false;
+      },
       error: () => { this.loading = false; }
     });
   }
 
   remove(productId: number) {
     this.cartService.removeItem(productId).subscribe({
-      next: c => { this.items = c.items; this.total = c.total; },
+      next: c => { this.items = c?.items ?? []; this.total = c?.total ?? 0; },
       error: err => this.snack.open(err.error?.error || 'Remove failed', 'Close', { duration: 3000 })
     });
   }

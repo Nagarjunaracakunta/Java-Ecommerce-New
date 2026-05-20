@@ -35,3 +35,15 @@ rate-limit:
 logging:
   level:
     com.fooddelivery.apigateway: DEBUG
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    prometheus:
+      enabled: true
+  metrics:
+    tags:
+      service: ${spring.application.name}

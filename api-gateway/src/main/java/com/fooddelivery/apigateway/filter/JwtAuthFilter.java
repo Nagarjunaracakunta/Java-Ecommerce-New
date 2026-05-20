@@ -30,7 +30,8 @@ public class JwtAuthFilter implements WebFilter {
     private static final List<PublicRoute> PUBLIC_ROUTES = List.of(
             new PublicRoute(HttpMethod.POST, "/auth/login"),
             new PublicRoute(HttpMethod.POST, "/auth/register"),
-            new PublicRoute(HttpMethod.GET,  "/products")   // all GET /products/** are public
+            new PublicRoute(HttpMethod.GET,  "/products"),  // all GET /products/** are public
+            new PublicRoute(HttpMethod.GET,  "/actuator")   // Prometheus scrapes /actuator/prometheus
     );
 
     private record PublicRoute(HttpMethod method, String pathPrefix) {

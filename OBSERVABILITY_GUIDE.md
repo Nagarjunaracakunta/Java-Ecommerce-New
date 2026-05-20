@@ -73,7 +73,6 @@ Spring Boot Service
 | `logger_name` | `com.example.auth.AuthController` | logback |
 | `thread_name` | `http-nio-8080-exec-1` | logback |
 
-docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 ---
 
 ## 3. Start the ELK Stack
@@ -178,7 +177,7 @@ yellow  ecommerce-logs-order-service-2026.05.20
 2. If prompted with "Welcome to Kibana" or "Select your space", click **Explore on my own**.
 3. If asked for credentials — this setup has `xpack.security.enabled=false`, so there is no login required.
 4. You are now on the Kibana home screen.
-   http://localhost:5601/app/dashboards#/view/dashboard-microservices?_g=(filters:!(),refreshInterval:(pause:!f,value:10000),time:(from:now-24h,to:now))
+
 **Navigation shortcut**: Click the hamburger menu (☰) at the top-left to open the full menu.
 
 ---
